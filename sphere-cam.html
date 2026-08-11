@@ -245,10 +245,13 @@ function onOrient(e){
 
 /* ---------------- WebGL setup ---------------- */
 const gl = glCanvas.getContext('webgl', {preserveDrawingBuffer:true});
-let PW = 4096, PH = 2048;
+let PW = 4096, PH = 2048;                 // stitching canvas (equirect)
+const IW = 4096, IH = 2048;               // imported-photo texture
 if (gl){
   const maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE);
-  if (maxTex < 4096){ PW = 2048; PH = 1024; }
+  const maxVp = gl.getParameter(gl.MAX_VIEWPORT_DIMS);
+  if (maxTex >= 8192 && maxVp && maxVp[0] >= 8192){ PW = 8192; PH = 4096; }  // 8K on capable GPUs
+  else if (maxTex < 4096){ PW = 2048; PH = 1024; }
 }
 const VERT = `attribute vec2 aPos; varying vec2 vUV;
   void main(){ gl_Position = vec4(aPos,0.,1.); vUV = aPos*0.5+0.5; }`;
@@ -292,7 +295,7 @@ function makeProg(fragSrc){
 }
 let progPaint, progFlat, progView, progPredict, quadBuf, panoTex, imgTex, videoTex, fbo, curTex;
 let predTex, predFbo, thumbCtx;
-const ALIGN = 128;                 // alignment thumbnail size
+const ALIGN = 192;                 // alignment thumbnail size
 if (gl){
   progPaint = makeProg(FRAG_PAINT); progFlat = makeProg(FRAG_FLAT); progView = makeProg(FRAG_VIEW);
   // predict variant: same render but exposes pano coverage in the alpha channel
@@ -312,7 +315,7 @@ if (gl){
     return t;
   };
   panoTex = makeTex(PW,PH);
-  imgTex  = makeTex(PW,PH);
+  imgTex  = makeTex(IW,IH);
   videoTex = gl.createTexture();
   gl.bindTexture(gl.TEXTURE_2D, videoTex);
   gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
@@ -324,6 +327,8 @@ if (gl){
   gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
   gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, panoTex, 0);
   predTex = makeTex(ALIGN, ALIGN);
+  // 192 is non-power-of-two: REPEAT would make it unsampleable (we only readPixels, but keep it legal)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   predFbo = gl.createFramebuffer();
   gl.bindFramebuffer(gl.FRAMEBUFFER, predFbo);
   gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, predTex, 0);
@@ -407,7 +412,7 @@ async function startCapture(){
   }catch(err){ toast('Could not access motion sensors: ' + err.message); return; }
   try{
     stream = await navigator.mediaDevices.getUserMedia({
-      video:{ facingMode:{ideal:'environment'}, width:{ideal:1280}, height:{ideal:960} }, audio:false });
+      video:{ facingMode:{ideal:'environment'}, width:{ideal:2560}, height:{ideal:1920} }, audio:false });
   }catch(err){
     toast(err.name === 'NotAllowedError'
       ? 'Camera access was denied. Allow it in Safari settings and retry.'
@@ -441,8 +446,29 @@ async function keepAwake(on){
    shot will land, compare it with the live frame, and nudge the shot's
    orientation (±~3°) + exposure gain until the overlap actually matches.
    This corrects the gyroscope's error with image evidence, Photo-Sphere-style. */
+const normv = v => { const n=Math.hypot(v[0],v[1],v[2]); return [v[0]/n,v[1]/n,v[2]/n]; };
+const crossv = (a,b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+function matToQuat(m){
+  const t = m[0]+m[4]+m[8];
+  if (t > 0){ const s=Math.sqrt(t+1)*2; return [(m[7]-m[5])/s,(m[2]-m[6])/s,(m[3]-m[1])/s,s/4]; }
+  if (m[0]>m[4] && m[0]>m[8]){ const s=Math.sqrt(1+m[0]-m[4]-m[8])*2;
+    return [s/4,(m[1]+m[3])/s,(m[2]+m[6])/s,(m[7]-m[5])/s]; }
+  if (m[4]>m[8]){ const s=Math.sqrt(1+m[4]-m[0]-m[8])*2;
+    return [(m[1]+m[3])/s,s/4,(m[5]+m[7])/s,(m[2]-m[6])/s]; }
+  const s=Math.sqrt(1+m[8]-m[0]-m[4])*2;
+  return [(m[2]+m[6])/s,(m[5]+m[7])/s,s/4,(m[3]-m[1])/s];
+}
+function triadQuat(a1,a2,b1,b2){   // rotation R with R·a ≈ b, from two direction pairs
+  const A1=normv(a1), B1=normv(b1);
+  const A3=normv(crossv(A1,a2)), B3=normv(crossv(B1,b2));
+  const A2=crossv(A3,A1), B2=crossv(B3,B1);
+  const R=new Array(9);
+  for (let i=0;i<3;i++) for (let j=0;j<3;j++)
+    R[i*3+j]=B1[i]*A1[j]+B2[i]*A2[j]+B3[i]*A3[j];
+  return matToQuat(R);
+}
 function refineShot(q){
-  const S = ALIGN, HALF = S/2, MAXS = 8;
+  const S = ALIGN, HALF = S/2, M = 16, SUB = 2;
   gl.bindFramebuffer(gl.FRAMEBUFFER, predFbo);
   gl.viewport(0,0,S,S);
   gl.disable(gl.BLEND);
@@ -471,36 +497,80 @@ function refineShot(q){
       gv[i] = 0.299*vv[iv]+0.587*vv[iv+1]+0.114*vv[iv+2];
     }
   }
+  const evalShift = (g, sx, sy) => {
+    let sum=0, cnt=0;
+    for (let y=M; y<S-M; y+=SUB){
+      const row=y*S, rowS=(y+sy)*S+sx;
+      for (let x=M; x<S-M; x+=SUB){
+        const i=row+x;
+        if (!mask[i]) continue;
+        sum += Math.abs(g[rowS+x] - gp[i]); cnt++;
+      }
+    }
+    return cnt > 800 ? sum/cnt : null;
+  };
+  // phase 1: translation only, coarse (step 2 px ≈ 0.4°)
   let best = null;
-  for (let sy=-MAXS; sy<=MAXS; sy++){
-    for (let sx=-MAXS; sx<=MAXS; sx++){
-      let sum=0, cnt=0;
-      for (let y=MAXS; y<S-MAXS; y+=2){
-        for (let x=MAXS; x<S-MAXS; x+=2){
-          const i=y*S+x;
-          if (!mask[i]) continue;
-          sum += Math.abs(gv[(y+sy)*S+(x+sx)] - gp[i]); cnt++;
-        }
-      }
-      if (cnt > 450){
-        const e = sum/cnt;
-        if (!best || e < best.e) best = {e, sx, sy};
-      }
+  for (let sy=-M; sy<=M; sy+=2){
+    for (let sx=-M; sx<=M; sx+=2){
+      const e = evalShift(gv, sx, sy);
+      if (e !== null && (!best || e < best.e)) best = {e, sx, sy, roll:0, scale:1, g:gv};
     }
   }
   if (!best) return {q, gain:1};                        // first shot / no overlap yet
+  // phase 2: refine around the winner with roll (tilt) and scale (FOV) variants
+  const mkWarp = (roll, scale) => {
+    if (roll === 0 && scale === 1) return gv;
+    const g2 = new Float32Array(S*S);
+    const cr = Math.cos(roll*D2R)/scale, sr = Math.sin(roll*D2R)/scale;
+    for (let y=0; y<S; y++){
+      const dy = y-HALF;
+      for (let x=0; x<S; x++){
+        const dx = x-HALF;
+        let u = HALF + cr*dx - sr*dy, v = HALF + sr*dx + cr*dy;
+        u = Math.min(S-1.001, Math.max(0, u)); v = Math.min(S-1.001, Math.max(0, v));
+        const x0=u|0, y0=v|0, fx=u-x0, fy=v-y0;
+        g2[y*S+x] = gv[y0*S+x0]*(1-fx)*(1-fy) + gv[y0*S+x0+1]*fx*(1-fy)
+                  + gv[(y0+1)*S+x0]*(1-fx)*fy + gv[(y0+1)*S+x0+1]*fx*fy;
+      }
+    }
+    return g2;
+  };
+  const bx = best.sx, by = best.sy;
+  for (const roll of [-1.5, 0, 1.5]){
+    for (const scale of [0.96, 1, 1.04]){
+      const g = mkWarp(roll, scale);
+      for (let sy=Math.max(-M,by-2); sy<=Math.min(M,by+2); sy++){
+        for (let sx=Math.max(-M,bx-2); sx<=Math.min(M,bx+2); sx++){
+          const e = evalShift(g, sx, sy);
+          if (e !== null && e < best.e) best = {e, sx, sy, roll, scale, g};
+        }
+      }
+    }
+  }
+  // exposure gain from the winning overlap
   let sp=0, sv=0, n=0;
-  for (let y=MAXS; y<S-MAXS; y+=2){
-    for (let x=MAXS; x<S-MAXS; x+=2){
+  for (let y=M; y<S-M; y+=SUB){
+    for (let x=M; x<S-M; x+=SUB){
       const i=y*S+x;
       if (!mask[i]) continue;
-      sp += gp[i]; sv += gv[(y+best.sy)*S+(x+best.sx)]; n++;
+      sp += gp[i]; sv += best.g[(y+best.sy)*S+(x+best.sx)]; n++;
     }
   }
   const gain = n && sv>1 ? Math.max(0.6, Math.min(1.5, sp/sv)) : 1;
-  const d = [-best.sx/HALF*camTanH, best.sy/HALF*camTanV, -1];
-  const dn = Math.hypot(d[0],d[1],d[2]);
-  const qc = Q.fromTo([0,0,-1], [d[0]/dn, d[1]/dn, d[2]/dn]);
+  // geometric correction from two pixel correspondences (sign-safe by construction):
+  // prediction pixel p matches video pixel T(p) = warp(p + shift)
+  const warpPt = (px,py) => {
+    const cr = Math.cos(best.roll*D2R)/best.scale, sr = Math.sin(best.roll*D2R)/best.scale;
+    const dx = px + best.sx - HALF, dy = py + best.sy - HALF;
+    return [HALF + cr*dx - sr*dy, HALF + sr*dx + cr*dy];
+  };
+  const pix2dir = (px,py) =>
+    normv([(px-HALF)/HALF*camTanH, (HALF-py)/HALF*camTanV, -1]);
+  const p1=[HALF,HALF], p2=[HALF+40,HALF];
+  const t1=warpPt(p1[0],p1[1]), t2=warpPt(p2[0],p2[1]);
+  const qc = triadQuat(pix2dir(t1[0],t1[1]), pix2dir(t2[0],t2[1]),
+                       pix2dir(p1[0],p1[1]), pix2dir(p2[0],p2[1]));
   return {q: Q.mul(q, qc), gain};
 }
 
@@ -717,8 +787,8 @@ $('fileInput').addEventListener('change', e=>{
   const img = new Image();
   img.onload = ()=>{
     const cv = document.createElement('canvas');
-    cv.width = PW; cv.height = PH;
-    cv.getContext('2d').drawImage(img, 0, 0, PW, PH);
+    cv.width = IW; cv.height = IH;
+    cv.getContext('2d').drawImage(img, 0, 0, IW, IH);
     gl.bindTexture(gl.TEXTURE_2D, imgTex);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, cv);
@@ -759,49 +829,72 @@ function addXmp(jpegBytes, xml){
   return out;
 }
 async function savePano(){
-  toast('Preparing 360° photo…');
-  const px = new Uint8Array(PW*PH*4);
-  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
-  gl.readPixels(0,0,PW,PH,gl.RGBA,gl.UNSIGNED_BYTE,px);
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  const cv = document.createElement('canvas'); cv.width = PW; cv.height = PH;
-  const ctx = cv.getContext('2d');
-  const im = ctx.createImageData(PW,PH);
-  const d = im.data;
-  for (let y=0; y<PH; y++){
-    const src = (PH-1-y)*PW*4, dst = y*PW*4;   // flip vertically
-    for (let x=0; x<PW*4; x+=4){
-      const a = px[src+x+3]/255;
-      d[dst+x]   = px[src+x]*a   + 18*(1-a);
-      d[dst+x+1] = px[src+x+1]*a + 20*(1-a);
-      d[dst+x+2] = px[src+x+2]*a + 22*(1-a);
-      d[dst+x+3] = 255;
-    }
+  toast('Preparing photo…');
+  await new Promise(r=>setTimeout(r,50));            // let the toast paint first
+  // Some phones silently refuse very large canvases — verify, else export at half size.
+  let EW = PW, EH = PH;
+  let cv = document.createElement('canvas'); cv.width = EW; cv.height = EH;
+  let ctx = cv.getContext('2d');
+  try{
+    ctx.fillStyle = '#fff'; ctx.fillRect(EW-1, EH-1, 1, 1);
+    if (ctx.getImageData(EW-1, EH-1, 1, 1).data[3] !== 255) throw 0;
+    ctx.clearRect(0,0,EW,EH);
+  }catch(e){
+    EW = PW/2; EH = PH/2;
+    cv = document.createElement('canvas'); cv.width = EW; cv.height = EH;
+    ctx = cv.getContext('2d');
   }
-  ctx.putImageData(im,0,0);
+  const scale = EW/PW;
+  // read the GPU panorama in horizontal bands (memory-friendly at 8K)
+  const BAND = 256;
+  const band = document.createElement('canvas'); band.width = PW; band.height = BAND;
+  const bctx = band.getContext('2d');
+  const px = new Uint8Array(PW*BAND*4);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  for (let y0=0; y0<PH; y0+=BAND){
+    const bh = Math.min(BAND, PH-y0);
+    gl.readPixels(0, PH-y0-bh, PW, bh, gl.RGBA, gl.UNSIGNED_BYTE,
+                  bh===BAND ? px : px.subarray(0, PW*bh*4));
+    const im = bctx.createImageData(PW, bh);
+    const d = im.data;
+    for (let r=0; r<bh; r++){
+      const src=(bh-1-r)*PW*4, dst=r*PW*4;           // flip vertically within band
+      for (let x=0; x<PW*4; x+=4){
+        const a = px[src+x+3]/255;
+        d[dst+x]   = px[src+x]*a   + 18*(1-a);
+        d[dst+x+1] = px[src+x+1]*a + 20*(1-a);
+        d[dst+x+2] = px[src+x+2]*a + 22*(1-a);
+        d[dst+x+3] = 255;
+      }
+    }
+    bctx.putImageData(im, 0, 0);
+    ctx.drawImage(band, 0, 0, PW, bh,
+                  0, Math.round(y0*scale), Math.round(PW*scale), Math.round(bh*scale));
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
   // per-mode output: sphere = full equirect; pano = horizontal strip (still a
   // valid 360 via GPano crop fields); wide = plain photo of the front region
-  let out = cv, xml = gpanoXmp(PW,PH,PW,PH,0,0);
+  let out = cv, xml = gpanoXmp(EW,EH,EW,EH,0,0);
   const vFovDeg = 2*Math.atan(camTanV)/D2R, hFovDeg = 2*Math.atan(camTanH)/D2R;
   if (captureMode === 'pano'){
     const halfDeg = Math.min(80, vFovDeg/2 + 6);
-    const top = Math.round((90-halfDeg)/180*PH);
-    const ch = Math.round(2*halfDeg/180*PH);
-    const o = document.createElement('canvas'); o.width = PW; o.height = ch;
-    o.getContext('2d').drawImage(cv, 0, top, PW, ch, 0, 0, PW, ch);
-    out = o; xml = gpanoXmp(PW,PH,PW,ch,0,top);
+    const top = Math.round((90-halfDeg)/180*EH);
+    const ch = Math.round(2*halfDeg/180*EH);
+    const o = document.createElement('canvas'); o.width = EW; o.height = ch;
+    o.getContext('2d').drawImage(cv, 0, top, EW, ch, 0, 0, EW, ch);
+    out = o; xml = gpanoXmp(EW,EH,EW,ch,0,top);
   } else if (captureMode === 'wide'){
     const span = Math.max(18, hFovDeg - 14);
     const halfW = Math.min(85, span + hFovDeg/2 + 4);
     const halfH = Math.min(80, 22 + vFovDeg/2 + 4);
-    const wpx = Math.round(2*halfW/360*PW), hpx = Math.round(2*halfH/180*PH);
-    const top = Math.round((90-halfH)/180*PH);
-    const cx = ((((yawOffset||0)+180)%360+360)%360)/360*PW;
+    const wpx = Math.round(2*halfW/360*EW), hpx = Math.round(2*halfH/180*EH);
+    const top = Math.round((90-halfH)/180*EH);
+    const cx = ((((yawOffset||0)+180)%360+360)%360)/360*EW;
     const o = document.createElement('canvas'); o.width = wpx; o.height = hpx;
     const c = o.getContext('2d');
-    let sx = Math.round(cx - wpx/2); sx = ((sx%PW)+PW)%PW;
-    const first = Math.min(wpx, PW - sx);
+    let sx = Math.round(cx - wpx/2); sx = ((sx%EW)+EW)%EW;
+    const first = Math.min(wpx, EW - sx);
     c.drawImage(cv, sx, top, first, hpx, 0, 0, first, hpx);
     if (first < wpx) c.drawImage(cv, 0, top, wpx-first, hpx, first, 0, wpx-first, hpx);
     out = o; xml = null;                          // a wide view is a normal photo
