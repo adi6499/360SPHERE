@@ -285,10 +285,11 @@ const VERT = `attribute vec2 aPos; varying vec2 vUV;
   void main(){ gl_Position = vec4(aPos,0.,1.); vUV = aPos*0.5+0.5; }`;
 const ROT = `vec3 qrot(vec4 q, vec3 v){ return v + 2.0*cross(q.xyz, cross(q.xyz,v) + q.w*v); }`;
 const FRAG_PAINT = `precision highp float; varying vec2 vUV;
-  uniform vec4 uQInv; uniform vec2 uTan; uniform vec3 uGain; uniform sampler2D uTex; ${ROT}
+  uniform vec4 uQInv; uniform vec2 uTan; uniform vec3 uGain; uniform sampler2D uTex;
+  uniform vec2 uWinC; uniform vec2 uWinH; ${ROT}
   void main(){
-    float lam = (vUV.x*2.0-1.0)*3.14159265;
-    float phi = (vUV.y-0.5)*3.14159265;
+    float lam = uWinC.x + (vUV.x*2.0-1.0)*uWinH.x;
+    float phi = uWinC.y + (vUV.y*2.0-1.0)*uWinH.y;
     vec3 dir = vec3(sin(lam)*cos(phi), sin(phi), -cos(lam)*cos(phi));
     vec3 v = qrot(uQInv, dir);
     if (v.z > -0.001) discard;
@@ -305,14 +306,18 @@ const FRAG_FLAT = `precision highp float; varying vec2 vUV; uniform sampler2D uT
     gl_FragColor = vec4(vec3(0.06,0.07,0.08)*(1.0-c.a) + c.rgb, 1.0);
   }`;
 const FRAG_VIEW = `precision highp float; varying vec2 vUV;
-  uniform vec4 uQ; uniform vec2 uTan; uniform sampler2D uTex; ${ROT}
+  uniform vec4 uQ; uniform vec2 uTan; uniform sampler2D uTex;
+  uniform vec2 uWinC; uniform vec2 uWinH; ${ROT}
   void main(){
     vec2 p = vUV*2.0-1.0;
     vec3 v = normalize(vec3(p.x*uTan.x, p.y*uTan.y, -1.0));
     vec3 d = qrot(uQ, v);
     float lam = atan(d.x, -d.z);
     float phi = asin(clamp(d.y,-1.0,1.0));
-    vec4 c = texture2D(uTex, vec2(lam/6.2831853+0.5, phi/3.14159265+0.5));
+    float dl = mod(lam - uWinC.x + 3.14159265, 6.2831853) - 3.14159265;
+    float dp = phi - uWinC.y;
+    vec4 c = texture2D(uTex, vec2(dl/(2.0*uWinH.x)+0.5, dp/(2.0*uWinH.y)+0.5));
+    if (abs(dl) > uWinH.x || abs(dp) > uWinH.y) c = vec4(0.0);
     gl_FragColor = vec4(vec3(0.06,0.07,0.08)*(1.0-c.a) + c.rgb, 1.0);
   }`;
 
@@ -421,6 +426,14 @@ let captureMode = 'sphere';            // 'wide' | 'pano' | 'sphere'
 let camTanH = 0.6, camTanV = 0.6;      // half-FOV tangents of the full video frame
 let targets = [], yawOffset = null, alignSince = 0, lastShotAt = 0, stream = null;
 let captureStartedAt = 0;
+/* The pano buffer maps onto an angular window. Sphere/pano use the full
+   sphere; Wide concentrates ALL buffer pixels on ~2:1 window around the
+   first aim direction — 2-3x sharper wide photos at the same memory. */
+let winC = [0, 0], winH = [Math.PI, Math.PI/2], winLamSet = true;
+function setWinUniforms(prog){
+  gl.uniform2f(gl.getUniformLocation(prog,'uWinC'), winC[0], winC[1]);
+  gl.uniform2f(gl.getUniformLocation(prog,'uWinH'), winH[0], winH[1]);
+}
 
 const MODE_LABEL = { wide:'Capture a wide view', pano:'Capture a panorama', sphere:'Capture a sphere' };
 document.querySelectorAll('#modeRow .mode').forEach(btn=>{
@@ -459,6 +472,10 @@ function makeTargets(){
   if (captureMode === 'wide'){
     for (const pitch of [22, -22])
       for (const yaw of [-span, 0, span]) targets.push({yaw, pitch, done:false});
+    const vFovDeg = 2*Math.atan(camTanV)/D2R;
+    const hphi = Math.min(60, 22 + vFovDeg/2 + 6);
+    winH = [2*hphi*D2R, hphi*D2R];         // 2:1 window matches the 2:1 buffer → square pixels
+    winC = [0, 0]; winLamSet = false;      // centre locks to the first aim direction
   } else if (captureMode === 'pano'){
     const n = Math.max(4, Math.ceil(360/span));
     for (let i=0;i<n;i++) targets.push({yaw:i*360/n, pitch:0, done:false});
@@ -470,6 +487,7 @@ function makeTargets(){
     targets.push({yaw:0, pitch:90, done:false});
     targets.push({yaw:0, pitch:-90, done:false});
   }
+  if (captureMode !== 'wide'){ winC = [0,0]; winH = [Math.PI, Math.PI/2]; winLamSet = true; }
   yawOffset = null;
   updateCounter();
 }
@@ -515,9 +533,8 @@ async function startCapture(){
     window.addEventListener('deviceorientation', onOrient);
   }catch(err){ toast('Could not access motion sensors: ' + err.message); return; }
   try{
-    const camW = PW >= 8192 ? 2560 : 1920, camH = PW >= 8192 ? 1920 : 1440;
     stream = await navigator.mediaDevices.getUserMedia({
-      video:{ facingMode:{ideal:'environment'}, width:{ideal:camW}, height:{ideal:camH} }, audio:false });
+      video:{ facingMode:{ideal:'environment'}, width:{ideal:2560}, height:{ideal:1920} }, audio:false });
   }catch(err){
     toast(err.name === 'NotAllowedError'
       ? 'Camera access was denied. Allow it in Safari settings and retry.'
@@ -721,6 +738,7 @@ function refineShot(q, skipCV){
   gl.useProgram(progPredict);
   gl.uniform4fv(gl.getUniformLocation(progPredict,'uQ'), q);
   gl.uniform2f(gl.getUniformLocation(progPredict,'uTan'), camTanH, camTanV);
+  setWinUniforms(progPredict);
   gl.uniform1i(gl.getUniformLocation(progPredict,'uTex'), 0);
   gl.activeTexture(gl.TEXTURE0);
   gl.bindTexture(gl.TEXTURE_2D, panoTex);
@@ -836,6 +854,7 @@ function channelGains(q){
   gl.useProgram(progPredict);
   gl.uniform4fv(gl.getUniformLocation(progPredict,'uQ'), q);
   gl.uniform2f(gl.getUniformLocation(progPredict,'uTan'), camTanH, camTanV);
+  setWinUniforms(progPredict);
   gl.uniform1i(gl.getUniformLocation(progPredict,'uTex'), 0);
   gl.activeTexture(gl.TEXTURE0);
   gl.bindTexture(gl.TEXTURE_2D, panoTex);
@@ -905,6 +924,7 @@ function captureShot(target){
   gl.useProgram(progPaint);
   gl.uniform4fv(gl.getUniformLocation(progPaint,'uQInv'), Q.conj(q));
   gl.uniform2f(gl.getUniformLocation(progPaint,'uTan'), camTanH, camTanV);
+  setWinUniforms(progPaint);
   gl.uniform3f(gl.getUniformLocation(progPaint,'uGain'), gains[0], gains[1], gains[2]);
   gl.uniform1i(gl.getUniformLocation(progPaint,'uTex'), 0);
   gl.activeTexture(gl.TEXTURE0);
@@ -920,8 +940,10 @@ function captureShot(target){
     paintChecked = true;
     const d = Q.rot(q, [0,0,-1]);
     const lam = Math.atan2(d[0], -d[2]), phi = Math.asin(Math.max(-1, Math.min(1, d[1])));
-    const x = ((Math.floor((lam/(2*Math.PI)+0.5)*PW))%PW+PW)%PW;
-    const y = Math.max(0, Math.min(PH-1, Math.floor((phi/Math.PI+0.5)*PH)));
+    let dl = lam - winC[0];
+    dl = ((dl + Math.PI) % (2*Math.PI) + 2*Math.PI) % (2*Math.PI) - Math.PI;
+    const x = Math.max(0, Math.min(PW-1, Math.floor((dl/(2*winH[0]) + 0.5) * PW)));
+    const y = Math.max(0, Math.min(PH-1, Math.floor(((phi - winC[1])/(2*winH[1]) + 0.5) * PH)));
     const pt = new Uint8Array(4);
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
     gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pt);
@@ -952,6 +974,7 @@ function ensureYawOffset(f){
   if (yawOffset === null){
     yawOffset = Math.atan2(f[0], -f[2]) / D2R;   // first target lands straight ahead
   }
+  if (!winLamSet){ winC = [yawOffset*D2R, 0]; winLamSet = true; }
 }
 
 /* ---------------- capture overlay & auto shutter ---------------- */
@@ -1063,6 +1086,7 @@ function renderView(){
   gl.useProgram(progView);
   gl.uniform4fv(gl.getUniformLocation(progView,'uQ'), q);
   gl.uniform2f(gl.getUniformLocation(progView,'uTan'), tanH, tanV);
+  setWinUniforms(progView);
   gl.uniform1i(gl.getUniformLocation(progView,'uTex'), 0);
   gl.activeTexture(gl.TEXTURE0);
   gl.bindTexture(gl.TEXTURE_2D, curTex);
@@ -1188,6 +1212,7 @@ async function savePano(){
   const bctx = band.getContext('2d');
   const px = new Uint8Array(PW*BAND*4);
   const rowCov = new Uint32Array(PH);              // per-row coverage, to trim black borders
+  const colCov = new Uint32Array(PW);
   gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
   for (let y0=0; y0<PH; y0+=BAND){
     const bh = Math.min(BAND, PH-y0);
@@ -1199,7 +1224,7 @@ async function savePano(){
       const src=(bh-1-r)*PW*4, dst=r*PW*4;           // flip vertically within band
       for (let x=0; x<PW*4; x+=4){
         const a = px[src+x+3]/255;
-        if (a > 0.5) rowCov[y0+r]++;
+        if (a > 0.5){ rowCov[y0+r]++; colCov[x>>2]++; }
         // stored colors are premultiplied by coverage — composite over the
         // background WITHOUT re-multiplying (re-multiplying darkened edges)
         d[dst+x]   = Math.min(255, px[src+x]   + 18*(1-a));
@@ -1234,21 +1259,15 @@ async function savePano(){
     o.getContext('2d').drawImage(cv, 0, top, EW, ch, 0, 0, EW, ch);
     out = o; xml = gpanoXmp(EW,EH,EW,ch,0,top);
   } else if (captureMode === 'wide'){
-    const span = Math.max(18, hFovDeg - 14);
-    const halfW = Math.min(85, span + hFovDeg/2 + 4);
-    const halfH = Math.min(80, 22 + vFovDeg/2 + 4);
-    const wpx = Math.round(2*halfW/360*EW);
-    let top = Math.round((90-halfH)/180*EH);
-    let bot = top + Math.round(2*halfH/180*EH);
-    if (covBotE - covTopE >= 64){ top = Math.max(top, covTopE); bot = Math.min(bot, covBotE); }
-    const hpx = bot - top;
-    const cx = ((((yawOffset||0)+180)%360+360)%360)/360*EW;
-    const o = document.createElement('canvas'); o.width = wpx; o.height = hpx;
-    const c = o.getContext('2d');
-    let sx = Math.round(cx - wpx/2); sx = ((sx%EW)+EW)%EW;
-    const first = Math.min(wpx, EW - sx);
-    c.drawImage(cv, sx, top, first, hpx, 0, 0, first, hpx);
-    if (first < wpx) c.drawImage(cv, 0, top, wpx-first, hpx, first, 0, wpx-first, hpx);
+    // windowed buffer: the whole canvas IS the photo — crop to actual coverage
+    const colThr = PH * 0.02;
+    let cL = 0; while (cL < PW-1 && colCov[cL] < colThr) cL++;
+    let cR = PW-1; while (cR > cL && colCov[cR] < colThr) cR--;
+    let left = Math.floor(cL*scale), right = Math.ceil((cR+1)*scale);
+    let top = covTopE, bot = covBotE;
+    if (bot - top < 64 || right - left < 64){ top = 0; bot = EH; left = 0; right = EW; }
+    const o = document.createElement('canvas'); o.width = right-left; o.height = bot-top;
+    o.getContext('2d').drawImage(cv, left, top, right-left, bot-top, 0, 0, right-left, bot-top);
     out = o; xml = null;                          // a wide view is a normal photo
   }
   const blob = await new Promise(r=>out.toBlob(r,'image/jpeg',0.92));
@@ -1294,7 +1313,9 @@ function toast(msg){
 
 $('startBtn').addEventListener('click', startCapture);
 $('openViewerBtn').addEventListener('click', ()=>{ if(!gl){toast('WebGL unavailable.');return;}
-  curTex = imgTex; setMode('viewer'); $('fileInput').click(); });
+  curTex = imgTex;
+  winC = [0,0]; winH = [Math.PI, Math.PI/2]; winLamSet = true;   // imported photos are full equirect
+  setMode('viewer'); $('fileInput').click(); });
 $('openFileBtn').addEventListener('click', ()=>$('fileInput').click());
 $('exitCaptureBtn').addEventListener('click', ()=>{ stopStream(); setMode('home'); });
 const RESULT_NOTES = {
@@ -1318,7 +1339,7 @@ $('gyroBtn2').addEventListener('click', toggleGyro);
 addEventListener('resize', ()=>{ sizeGL(); sizeOverlay(); });
 
 /* ---------------- PWA install + updates ---------------- */
-const APP_VERSION = '2.7';
+const APP_VERSION = '2.8';
 $('verLine').textContent = 'SphereCam v' + APP_VERSION + ' · ';
 let swReg = null, waitingSW = null;
 let hadController = ('serviceWorker' in navigator) && !!navigator.serviceWorker.controller;
