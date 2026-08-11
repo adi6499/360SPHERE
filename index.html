@@ -60,7 +60,8 @@
   #finishBtn[disabled]{opacity:.4;}
   #hint{position:absolute;left:0;right:0;bottom:calc(env(safe-area-inset-bottom) + 118px);text-align:center;
     font-size:14px;color:#fff;text-shadow:0 1px 6px rgba(0,0,0,.8);pointer-events:none;}
-  #gl{position:fixed;z-index:5;display:none;}
+  #gl{position:fixed;z-index:5;display:none;touch-action:none;}
+  #overlay,#cam{touch-action:none;}
   #gl.preview{display:block;left:16px;bottom:calc(env(safe-area-inset-bottom) + 16px);width:148px;height:74px;
     border-radius:10px;border:1px solid rgba(255,255,255,.25);}
   #gl.full{display:block;inset:0;left:0;top:0;width:100%;height:100%;border:0;border-radius:0;}
@@ -212,7 +213,12 @@ const Q = {
     return [s1*c2*c3+c1*s2*s3, c1*s2*c3-s1*c2*s3, c1*c2*s3-s1*s2*c3, c1*c2*c3+s1*s2*s3]; },
   rot(q,v){
     const tx=2*(q[1]*v[2]-q[2]*v[1]), ty=2*(q[2]*v[0]-q[0]*v[2]), tz=2*(q[0]*v[1]-q[1]*v[0]);
-    return [v[0]+q[3]*tx+(q[1]*tz-q[2]*ty), v[1]+q[3]*ty+(q[2]*tx-q[0]*tz), v[2]+q[3]*tz+(q[0]*ty-q[1]*tx)]; }
+    return [v[0]+q[3]*tx+(q[1]*tz-q[2]*ty), v[1]+q[3]*ty+(q[2]*tx-q[0]*tz), v[2]+q[3]*tz+(q[0]*ty-q[1]*tx)]; },
+  fromTo(a,b){  // shortest rotation taking unit vector a to unit vector b
+    const cx=a[1]*b[2]-a[2]*b[1], cy=a[2]*b[0]-a[0]*b[2], cz=a[0]*b[1]-a[1]*b[0];
+    const w=1+a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+    const n=Math.hypot(cx,cy,cz,w);
+    return n>1e-6 ? [cx/n,cy/n,cz/n,w/n] : [1,0,0,0]; }
 };
 const dirOf = (yawDeg,pitchDeg)=>{
   const y=yawDeg*D2R, p=pitchDeg*D2R;
@@ -249,7 +255,7 @@ const VERT = `attribute vec2 aPos; varying vec2 vUV;
   void main(){ gl_Position = vec4(aPos,0.,1.); vUV = aPos*0.5+0.5; }`;
 const ROT = `vec3 qrot(vec4 q, vec3 v){ return v + 2.0*cross(q.xyz, cross(q.xyz,v) + q.w*v); }`;
 const FRAG_PAINT = `precision highp float; varying vec2 vUV;
-  uniform vec4 uQInv; uniform vec2 uTan; uniform sampler2D uTex; ${ROT}
+  uniform vec4 uQInv; uniform vec2 uTan; uniform float uGain; uniform sampler2D uTex; ${ROT}
   void main(){
     float lam = (vUV.x*2.0-1.0)*3.14159265;
     float phi = (vUV.y-0.5)*3.14159265;
@@ -260,7 +266,7 @@ const FRAG_PAINT = `precision highp float; varying vec2 vUV;
     if (abs(t.x) > 1.0 || abs(t.y) > 1.0) discard;
     vec2 uv = vec2(t.x*0.5+0.5, 0.5 - t.y*0.5);
     float a = smoothstep(1.0,0.82,abs(t.x)) * smoothstep(1.0,0.82,abs(t.y));
-    gl_FragColor = vec4(texture2D(uTex, uv).rgb, max(a, 0.05));
+    gl_FragColor = vec4(min(texture2D(uTex, uv).rgb * uGain, 1.0), max(a, 0.05));
   }`;
 const FRAG_FLAT = `precision highp float; varying vec2 vUV; uniform sampler2D uTex;
   void main(){
@@ -285,9 +291,13 @@ function makeProg(fragSrc){
   const p = gl.createProgram(); gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
   return p;
 }
-let progPaint, progFlat, progView, quadBuf, panoTex, imgTex, videoTex, fbo, curTex;
+let progPaint, progFlat, progView, progPredict, quadBuf, panoTex, imgTex, videoTex, fbo, curTex;
+let predTex, predFbo, thumbCtx;
+const ALIGN = 128;                 // alignment thumbnail size
 if (gl){
   progPaint = makeProg(FRAG_PAINT); progFlat = makeProg(FRAG_FLAT); progView = makeProg(FRAG_VIEW);
+  // predict variant: same render but exposes pano coverage in the alpha channel
+  progPredict = makeProg(FRAG_VIEW.replace('c.a), 1.0);', 'c.a), c.a);'));
   quadBuf = gl.createBuffer();
   gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
   gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
@@ -314,8 +324,15 @@ if (gl){
   fbo = gl.createFramebuffer();
   gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
   gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, panoTex, 0);
+  predTex = makeTex(ALIGN, ALIGN);
+  predFbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, predFbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, predTex, 0);
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   curTex = panoTex;
+  const tc = document.createElement('canvas');
+  tc.width = ALIGN; tc.height = ALIGN;
+  thumbCtx = tc.getContext('2d', {willReadFrequently:true});
 }
 function drawQuad(prog){
   const loc = gl.getAttribLocation(prog, 'aPos');
@@ -345,7 +362,7 @@ function computeFov(){
 function makeTargets(){
   targets = [];
   const hFovDeg = 2*Math.atan(camTanH)/D2R;   // horizontal FOV (short side in portrait)
-  const span = Math.max(20, hFovDeg - 10);    // 10° overlap between neighbours
+  const span = Math.max(18, hFovDeg - 14);    // 14° overlap gives the aligner evidence to work with
   for (const pitch of [0, 45, -45]){
     const n = Math.max(4, Math.ceil(360*Math.cos(pitch*D2R)/span));
     for (let i=0;i<n;i++) targets.push({yaw:i*360/n, pitch, done:false});
@@ -386,17 +403,94 @@ async function startCapture(){
     video.onloadedmetadata = ()=>res();
   });
   computeFov(); makeTargets(); clearPano();
+  keepAwake(true);
   setMode('capture');
   setTimeout(()=>{ if(!gotGyro && mode==='capture')
     toast('No motion data — capture needs a phone with a gyroscope (iPhone/Android).'); }, 2500);
 }
 function stopStream(){
   if (stream){ stream.getTracks().forEach(t=>t.stop()); stream = null; video.srcObject = null; }
+  keepAwake(false);
+}
+let wakeLock = null;
+async function keepAwake(on){
+  try{
+    if (on && 'wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen');
+    else if (!on && wakeLock){ wakeLock.release(); wakeLock = null; }
+  }catch(e){}
+}
+
+/* Pixel-based seam refinement: render what the pano already has where this
+   shot will land, compare it with the live frame, and nudge the shot's
+   orientation (±~3°) + exposure gain until the overlap actually matches.
+   This corrects the gyroscope's error with image evidence, Photo-Sphere-style. */
+function refineShot(q){
+  const S = ALIGN, HALF = S/2, MAXS = 8;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, predFbo);
+  gl.viewport(0,0,S,S);
+  gl.disable(gl.BLEND);
+  gl.useProgram(progPredict);
+  gl.uniform4fv(gl.getUniformLocation(progPredict,'uQ'), q);
+  gl.uniform2f(gl.getUniformLocation(progPredict,'uTan'), camTanH, camTanV);
+  gl.uniform1i(gl.getUniformLocation(progPredict,'uTex'), 0);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, panoTex);
+  drawQuad(progPredict);
+  const pp = new Uint8Array(S*S*4);
+  gl.readPixels(0,0,S,S,gl.RGBA,gl.UNSIGNED_BYTE,pp);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+  thumbCtx.drawImage(video, 0, 0, S, S);
+  const vv = thumbCtx.getImageData(0,0,S,S).data;
+
+  const gp = new Float32Array(S*S), gv = new Float32Array(S*S), mask = new Uint8Array(S*S);
+  for (let y=0; y<S; y++){
+    for (let x=0; x<S; x++){
+      const i = y*S+x;
+      const ip = ((S-1-y)*S+x)*4;                       // readPixels rows are bottom-up
+      gp[i] = 0.299*pp[ip]+0.587*pp[ip+1]+0.114*pp[ip+2];
+      mask[i] = pp[ip+3] > 242 ? 1 : 0;
+      const iv = i*4;
+      gv[i] = 0.299*vv[iv]+0.587*vv[iv+1]+0.114*vv[iv+2];
+    }
+  }
+  let best = null;
+  for (let sy=-MAXS; sy<=MAXS; sy++){
+    for (let sx=-MAXS; sx<=MAXS; sx++){
+      let sum=0, cnt=0;
+      for (let y=MAXS; y<S-MAXS; y+=2){
+        for (let x=MAXS; x<S-MAXS; x+=2){
+          const i=y*S+x;
+          if (!mask[i]) continue;
+          sum += Math.abs(gv[(y+sy)*S+(x+sx)] - gp[i]); cnt++;
+        }
+      }
+      if (cnt > 450){
+        const e = sum/cnt;
+        if (!best || e < best.e) best = {e, sx, sy};
+      }
+    }
+  }
+  if (!best) return {q, gain:1};                        // first shot / no overlap yet
+  let sp=0, sv=0, n=0;
+  for (let y=MAXS; y<S-MAXS; y+=2){
+    for (let x=MAXS; x<S-MAXS; x+=2){
+      const i=y*S+x;
+      if (!mask[i]) continue;
+      sp += gp[i]; sv += gv[(y+best.sy)*S+(x+best.sx)]; n++;
+    }
+  }
+  const gain = n && sv>1 ? Math.max(0.6, Math.min(1.5, sp/sv)) : 1;
+  const d = [-best.sx/HALF*camTanH, best.sy/HALF*camTanV, -1];
+  const dn = Math.hypot(d[0],d[1],d[2]);
+  const qc = Q.fromTo([0,0,-1], [d[0]/dn, d[1]/dn, d[2]/dn]);
+  return {q: Q.mul(q, qc), gain};
 }
 
 function captureShot(target){
   if (!deviceQuat || !video.videoWidth) return;
-  const q = deviceQuat.slice();
+  let q = deviceQuat.slice(), gain = 1;
+  try{ const r = refineShot(q); q = r.q; gain = r.gain; }catch(e){}
   gl.bindTexture(gl.TEXTURE_2D, videoTex);
   gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
@@ -406,6 +500,7 @@ function captureShot(target){
   gl.useProgram(progPaint);
   gl.uniform4fv(gl.getUniformLocation(progPaint,'uQInv'), Q.conj(q));
   gl.uniform2f(gl.getUniformLocation(progPaint,'uTan'), camTanH, camTanV);
+  gl.uniform1f(gl.getUniformLocation(progPaint,'uGain'), gain);
   gl.uniform1i(gl.getUniformLocation(progPaint,'uTex'), 0);
   gl.activeTexture(gl.TEXTURE0);
   gl.bindTexture(gl.TEXTURE_2D, videoTex);
@@ -507,11 +602,11 @@ function drawCaptureFrame(now){
     } else {
       $('hint').textContent = nextAng < 6*D2R ? 'Hold steady…' : 'Point the circle at the amber dot';
     }
-    // auto shutter: aligned + still, held ~350 ms
+    // auto shutter: aligned + still, held ~420 ms (stillness = sharper frames)
     const cool = now - lastShotAt > 600;
-    if (cool && nextAng < 6*D2R && angVel < 0.45){
+    if (cool && nextAng < 5.5*D2R && angVel < 0.35){
       if (!alignSince) alignSince = now;
-      const prog = Math.min(1, (now-alignSince)/350);
+      const prog = Math.min(1, (now-alignSince)/420);
       ctx.strokeStyle = '#FFB454'; ctx.lineWidth = 4*DPR;
       ctx.beginPath(); ctx.arc(cx,cy,R,-Math.PI/2,-Math.PI/2+prog*2*Math.PI); ctx.stroke();
       if (prog >= 1){ alignSince = 0; captureShot(next); }
