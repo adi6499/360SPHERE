@@ -121,8 +121,9 @@
       <button class="btn primary" id="startBtn">Capture a sphere</button>
       <button class="btn" id="openViewerBtn">View a 360° photo</button>
       <button class="btn" id="installBtn" style="display:none">Install as app</button>
+      <button class="btn" id="updateBtn" style="display:none">Check for updates</button>
     </div>
-    <div class="fineprint">Needs camera + motion access (you'll be asked once). Best held upright in one hand, turning on the spot. Stitching is done live on your phone — nothing is uploaded anywhere.<br>On iPhone: tap Share → <b>Add to Home Screen</b> to install SphereCam as an app.</div>
+    <div class="fineprint"><span id="verLine"></span>Needs camera + motion access (you'll be asked once). Best held upright in one hand, turning on the spot. Stitching is done live on your phone — nothing is uploaded anywhere.<br>On iPhone: tap Share → <b>Add to Home Screen</b> to install SphereCam as an app.</div>
   </div>
 </div>
 
@@ -295,7 +296,7 @@ function makeProg(fragSrc){
 }
 let progPaint, progFlat, progView, progPredict, quadBuf, panoTex, imgTex, videoTex, fbo, curTex;
 let predTex, predFbo, thumbCtx;
-const ALIGN = 192;                 // alignment thumbnail size
+const ALIGN = 256;                 // alignment thumbnail size
 if (gl){
   progPaint = makeProg(FRAG_PAINT); progFlat = makeProg(FRAG_FLAT); progView = makeProg(FRAG_VIEW);
   // predict variant: same render but exposes pano coverage in the alpha channel
@@ -403,6 +404,7 @@ function updateCounter(){
 
 async function startCapture(){
   if (!gl){ toast('WebGL is not available in this browser.'); return; }
+  loadOpenCV();                          // warm up the feature engine in the background
   try{
     if (window.DeviceOrientationEvent && typeof DeviceOrientationEvent.requestPermission === 'function'){
       const r = await DeviceOrientationEvent.requestPermission();
@@ -446,6 +448,136 @@ async function keepAwake(on){
    shot will land, compare it with the live frame, and nudge the shot's
    orientation (±~3°) + exposure gain until the overlap actually matches.
    This corrects the gyroscope's error with image evidence, Photo-Sphere-style. */
+/* ---------- OpenCV feature engine (lazy-loaded, optional) ----------
+   When opencv.js is present (the self-hosted GitHub Pages copy), shots are
+   aligned by ORB feature matching + RANSAC — sub-pixel accurate and able to
+   fix errors far larger than the grid search. Absent (Artifact copy), the
+   grid-search aligner below remains the fallback. */
+let cvReady = false, cvLoading = null;
+function loadOpenCV(){
+  if (cvReady || cvLoading) return cvLoading;
+  cvLoading = new Promise(res=>{
+    const s = document.createElement('script');
+    s.src = 'opencv.js'; s.async = true;
+    const done = ()=>{ cvReady = true; toast('High-accuracy stitching engine ready'); res(); };
+    s.onload = ()=>{
+      const c = window.cv;
+      if (!c) return res();
+      if (typeof c.then === 'function') c.then(m=>{ window.cv = m; done(); });
+      else if (c.Mat) done();
+      else c.onRuntimeInitialized = done;
+    };
+    s.onerror = ()=>res();
+    document.head.appendChild(s);
+  });
+  return cvLoading;
+}
+const det3 = m => m[0]*(m[4]*m[8]-m[5]*m[7]) - m[1]*(m[3]*m[8]-m[5]*m[6]) + m[2]*(m[3]*m[7]-m[4]*m[6]);
+function solve3(A,b){
+  const d = det3(A); if (Math.abs(d) < 1e-9) return null;
+  return [
+    det3([b[0],A[1],A[2], b[1],A[4],A[5], b[2],A[7],A[8]])/d,
+    det3([A[0],b[0],A[2], A[3],b[1],A[5], A[6],b[2],A[8]])/d,
+    det3([A[0],A[1],b[0], A[3],A[4],b[1], A[6],A[7],b[2]])/d ];
+}
+function tryCV(q, gp, mask, gv){
+  const S = ALIGN, HALF = S/2, N = S*S;
+  const gp8 = new Uint8Array(N), gv8 = new Uint8Array(N), mk8 = new Uint8Array(N);
+  for (let i=0;i<N;i++){ gp8[i]=gp[i]; gv8[i]=gv[i]; }
+  const E = 6;                                    // erode mask: no features on feathered edges
+  for (let y=E;y<S-E;y++) for (let x=E;x<S-E;x++){
+    const i=y*S+x;
+    if (mask[i] && mask[i-E] && mask[i+E] && mask[i-E*S] && mask[i+E*S]) mk8[i]=255;
+  }
+  const thumbDir = (px,py)=> normv([(px-HALF)/HALF*camTanH, (HALF-py)/HALF*camTanV, -1]);
+  let mp,mv,mm,mEmpty,orb,kp1,kp2,d1,d2,bf,matches;
+  try{
+    mp = cv.matFromArray(S,S,cv.CV_8UC1,gp8);
+    mv = cv.matFromArray(S,S,cv.CV_8UC1,gv8);
+    mm = cv.matFromArray(S,S,cv.CV_8UC1,mk8);
+    mEmpty = new cv.Mat();
+    try{ orb = new cv.ORB(600); }catch(e){ orb = new cv.ORB(); }
+    kp1 = new cv.KeyPointVector(); d1 = new cv.Mat();
+    kp2 = new cv.KeyPointVector(); d2 = new cv.Mat();
+    orb.detectAndCompute(mp, mm, kp1, d1);
+    orb.detectAndCompute(mv, mEmpty, kp2, d2);
+    if (d1.rows < 8 || d2.rows < 8) return null;
+    bf = new cv.BFMatcher(cv.NORM_HAMMING, false);
+    matches = new cv.DMatchVectorVector();
+    bf.knnMatch(d1, d2, matches, 2);
+    const A=[], B=[], PP=[], PV=[];               // video dirs, prediction dirs, thumb points
+    for (let i=0;i<matches.size();i++){
+      const m = matches.get(i);
+      if (m.size() < 2) continue;
+      const m0 = m.get(0), m1 = m.get(1);
+      if (m0.distance < 0.75*m1.distance){
+        const p1 = kp1.get(m0.queryIdx).pt, p2 = kp2.get(m0.trainIdx).pt;
+        B.push(thumbDir(p1.x,p1.y)); A.push(thumbDir(p2.x,p2.y));
+        PP.push(p1); PV.push(p2);
+      }
+    }
+    if (A.length < 10) return null;
+    // RANSAC over 2-point rotation hypotheses
+    const cosThr = Math.cos(1.2*D2R), cosSep = Math.cos(3*D2R);
+    let bi = null;
+    for (let it=0; it<150; it++){
+      const i = (Math.random()*A.length)|0, j = (Math.random()*A.length)|0;
+      if (i===j) continue;
+      if (A[i][0]*A[j][0]+A[i][1]*A[j][1]+A[i][2]*A[j][2] > cosSep) continue;
+      const qh = triadQuat(A[i], A[j], B[i], B[j]);
+      let cnt = 0;
+      for (let k=0;k<A.length;k++){
+        const r = Q.rot(qh, A[k]);
+        if (r[0]*B[k][0]+r[1]*B[k][1]+r[2]*B[k][2] > cosThr) cnt++;
+      }
+      if (!bi || cnt > bi.cnt) bi = {qh, cnt};
+    }
+    if (!bi || bi.cnt < 8) return null;
+    // small-angle least-squares polish on the inliers
+    let qc = bi.qh;
+    for (let pass=0; pass<2; pass++){
+      const Am=[0,0,0,0,0,0,0,0,0], rhs=[0,0,0];
+      let used = 0;
+      for (let k=0;k<A.length;k++){
+        const c = Q.rot(qc, A[k]);
+        if (c[0]*B[k][0]+c[1]*B[k][1]+c[2]*B[k][2] < cosThr) continue;
+        used++;
+        const r = [B[k][0]-c[0], B[k][1]-c[1], B[k][2]-c[2]];   // r ≈ δ × c
+        const M = [0,c[2],-c[1], -c[2],0,c[0], c[1],-c[0],0];
+        for (let a=0;a<3;a++){
+          for (let b2=0;b2<3;b2++){
+            let s=0; for (let t=0;t<3;t++) s += M[t*3+a]*M[t*3+b2];
+            Am[a*3+b2] += s;
+          }
+          let s2=0; for (let t=0;t<3;t++) s2 += M[t*3+a]*r[t];
+          rhs[a] += s2;
+        }
+      }
+      if (used < 8) break;
+      const del = solve3(Am, rhs);
+      if (!del) break;
+      const mag = Math.hypot(del[0],del[1],del[2]);
+      if (mag < 1e-6) break;
+      const qd = Q.axisAngle([del[0]/mag, del[1]/mag, del[2]/mag], Math.min(mag, 3*D2R));
+      qc = Q.mul(qd, qc);
+    }
+    // exposure gain from inlier intensities
+    let sp=0, sv=0, n=0;
+    for (let k=0;k<A.length;k++){
+      const c = Q.rot(qc, A[k]);
+      if (c[0]*B[k][0]+c[1]*B[k][1]+c[2]*B[k][2] < cosThr) continue;
+      sp += gp[(PP[k].y|0)*S+(PP[k].x|0)];
+      sv += gv[(PV[k].y|0)*S+(PV[k].x|0)]; n++;
+    }
+    const gain = n>=6 && sv>1 ? Math.max(0.6, Math.min(1.5, sp/sv)) : 1;
+    return {q: Q.mul(q, qc), gain};
+  }catch(e){ return null; }
+  finally{
+    for (const o of [mp,mv,mm,mEmpty,d1,d2,kp1,kp2,orb,bf,matches])
+      try{ if (o && o.delete) o.delete(); }catch(e){}
+  }
+}
+
 const normv = v => { const n=Math.hypot(v[0],v[1],v[2]); return [v[0]/n,v[1]/n,v[2]/n]; };
 const crossv = (a,b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
 function matToQuat(m){
@@ -468,7 +600,7 @@ function triadQuat(a1,a2,b1,b2){   // rotation R with R·a ≈ b, from two direc
   return matToQuat(R);
 }
 function refineShot(q){
-  const S = ALIGN, HALF = S/2, M = 16, SUB = 2;
+  const S = ALIGN, HALF = S/2, M = 20, SUB = 2;
   gl.bindFramebuffer(gl.FRAMEBUFFER, predFbo);
   gl.viewport(0,0,S,S);
   gl.disable(gl.BLEND);
@@ -497,6 +629,10 @@ function refineShot(q){
       gv[i] = 0.299*vv[iv]+0.587*vv[iv+1]+0.114*vv[iv+2];
     }
   }
+  if (cvReady && window.cv && cv.Mat){
+    const r = tryCV(q, gp, mask, gv);
+    if (r) return r;                    // feature alignment succeeded
+  }
   const evalShift = (g, sx, sy) => {
     let sum=0, cnt=0;
     for (let y=M; y<S-M; y+=SUB){
@@ -507,7 +643,7 @@ function refineShot(q){
         sum += Math.abs(g[rowS+x] - gp[i]); cnt++;
       }
     }
-    return cnt > 800 ? sum/cnt : null;
+    return cnt > 1300 ? sum/cnt : null;
   };
   // phase 1: translation only, coarse (step 2 px ≈ 0.4°)
   let best = null;
@@ -964,9 +1100,48 @@ $('gyroBtn1').addEventListener('click', toggleGyro);
 $('gyroBtn2').addEventListener('click', toggleGyro);
 addEventListener('resize', ()=>{ sizeGL(); sizeOverlay(); });
 
-/* ---------------- PWA install ---------------- */
-if ('serviceWorker' in navigator)
-  navigator.serviceWorker.register('sw.js').catch(()=>{});   // absent on the artifact copy — fine
+/* ---------------- PWA install + updates ---------------- */
+const APP_VERSION = '2.0';
+$('verLine').textContent = 'SphereCam v' + APP_VERSION + ' · ';
+let swReg = null, waitingSW = null;
+let hadController = ('serviceWorker' in navigator) && !!navigator.serviceWorker.controller;
+function showUpdateReady(sw){
+  waitingSW = sw;
+  const b = $('updateBtn');
+  b.style.display = 'flex';
+  b.textContent = 'Update ready — tap to restart';
+  toast('A new version of SphereCam is ready.');
+}
+if ('serviceWorker' in navigator){
+  navigator.serviceWorker.register('sw.js').then(reg=>{   // absent on the artifact copy — fine
+    swReg = reg;
+    $('updateBtn').style.display = 'flex';
+    if (reg.waiting && navigator.serviceWorker.controller) showUpdateReady(reg.waiting);
+    reg.addEventListener('updatefound', ()=>{
+      const nw = reg.installing;
+      if (nw) nw.addEventListener('statechange', ()=>{
+        if (nw.state === 'installed' && navigator.serviceWorker.controller) showUpdateReady(nw);
+      });
+    });
+  }).catch(()=>{});
+  navigator.serviceWorker.addEventListener('controllerchange', ()=>{
+    if (!hadController){ hadController = true; return; }   // first install: nothing to restart
+    location.reload();                                     // update activated → relaunch fresh
+  });
+}
+$('updateBtn').addEventListener('click', async ()=>{
+  if (waitingSW){ waitingSW.postMessage({type:'SKIP_WAITING'}); toast('Updating…'); return; }
+  if (!swReg) return;
+  const b = $('updateBtn');
+  b.textContent = 'Checking…';
+  try{ await swReg.update(); }catch(e){}
+  setTimeout(()=>{
+    if (!waitingSW){
+      b.textContent = 'Check for updates';
+      toast('You have the latest version (v' + APP_VERSION + ').');
+    }
+  }, 1500);
+});
 let deferredInstall = null;
 window.addEventListener('beforeinstallprompt', e=>{
   e.preventDefault(); deferredInstall = e;
