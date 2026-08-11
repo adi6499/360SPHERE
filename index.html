@@ -28,13 +28,14 @@
   .stage.on{display:block;}
 
   /* ---------- Home ---------- */
-  #home{display:none;padding:calc(env(safe-area-inset-top) + 28px) 24px calc(env(safe-area-inset-bottom) + 24px);}
-  #home.on{display:flex;flex-direction:column;justify-content:space-between;}
+  #home{display:none;padding:calc(env(safe-area-inset-top) + 20px) 24px calc(env(safe-area-inset-bottom) + 24px);
+    overflow-y:auto;-webkit-overflow-scrolling:touch;}
+  #home.on{display:flex;flex-direction:column;justify-content:space-between;gap:20px;}
   .wordmark{font-size:15px;letter-spacing:.18em;text-transform:uppercase;color:var(--mut);font-weight:600;}
   .wordmark b{color:var(--amber);font-weight:600;}
-  .hero h1{font-size:clamp(30px,8vw,44px);line-height:1.12;margin:18px 0 10px;font-weight:700;letter-spacing:-.02em;text-wrap:balance;}
-  .hero p{color:var(--mut);font-size:16px;line-height:1.5;max-width:34ch;margin:0;}
-  #sphereArt{width:132px;height:132px;margin:26px 0 6px;}
+  .hero h1{font-size:clamp(24px,6.5vw,38px);line-height:1.12;margin:12px 0 8px;font-weight:700;letter-spacing:-.02em;text-wrap:balance;}
+  .hero p{color:var(--mut);font-size:15px;line-height:1.5;max-width:36ch;margin:0;}
+  #sphereArt{width:96px;height:96px;margin:14px 0 2px;}
   .modes{display:flex;gap:8px;margin-bottom:12px;}
   .mode{flex:1;display:flex;flex-direction:column;gap:3px;align-items:flex-start;text-align:left;
     background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:11px 12px;}
@@ -47,7 +48,7 @@
     padding:16px 20px;font-size:17px;font-weight:600;background:var(--panel);border:1px solid var(--line);}
   .btn.primary{background:var(--amber);color:#20160A;border-color:var(--amber);}
   .btn:active{transform:scale(.985);}
-  .steps{display:flex;flex-direction:column;gap:8px;margin:22px 0 8px;color:var(--mut);font-size:13.5px;line-height:1.45;}
+  .steps{display:flex;flex-direction:column;gap:6px;margin:16px 0 4px;color:var(--mut);font-size:13px;line-height:1.45;}
   .steps span{color:var(--text);font-weight:600;}
   .fineprint{color:#5C666E;font-size:12px;line-height:1.5;margin-top:14px;}
 
@@ -1237,7 +1238,7 @@ $('gyroBtn2').addEventListener('click', toggleGyro);
 addEventListener('resize', ()=>{ sizeGL(); sizeOverlay(); });
 
 /* ---------------- PWA install + updates ---------------- */
-const APP_VERSION = '2.2';
+const APP_VERSION = '2.3';
 $('verLine').textContent = 'SphereCam v' + APP_VERSION + ' · ';
 let swReg = null, waitingSW = null;
 let hadController = ('serviceWorker' in navigator) && !!navigator.serviceWorker.controller;
