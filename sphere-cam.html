@@ -406,6 +406,7 @@ let mode = 'home';
 let captureMode = 'sphere';            // 'wide' | 'pano' | 'sphere'
 let camTanH = 0.6, camTanV = 0.6;      // half-FOV tangents of the full video frame
 let targets = [], yawOffset = null, alignSince = 0, lastShotAt = 0, stream = null;
+let captureStartedAt = 0;
 
 const MODE_LABEL = { wide:'Capture a wide view', pano:'Capture a panorama', sphere:'Capture a sphere' };
 document.querySelectorAll('#modeRow .mode').forEach(btn=>{
@@ -508,10 +509,6 @@ async function startCapture(){
       ? 'Camera access was denied. Allow it in Safari settings and retry.'
       : 'Camera error: ' + err.name); return;
   }
-  if (!cvReady){                      // shots aligned without the engine smear more — wait for it
-    toast('Loading high-accuracy engine…');
-    await Promise.race([loadOpenCV(), new Promise(r=>setTimeout(r, 20000))]);
-  }
   video.srcObject = stream;
   try{ await video.play(); }catch(e){}
   await new Promise(res=>{
@@ -520,6 +517,7 @@ async function startCapture(){
   });
   computeFov(); makeTargets(); clearPano();
   paintChecked = false;
+  captureStartedAt = performance.now();
   keepAwake(true);
   setMode('capture');
   toast('Sphere ' + PW + '×' + PH + ' • camera ' + video.videoWidth + '×' + video.videoHeight);
@@ -549,21 +547,22 @@ async function keepAwake(on){
    aligned by ORB feature matching + RANSAC — sub-pixel accurate and able to
    fix errors far larger than the grid search. Absent (Artifact copy), the
    grid-search aligner below remains the fallback. */
-let cvReady = false, cvLoading = null;
+let cvReady = false, cvSettled = false, cvLoading = null;
 function loadOpenCV(){
   if (cvReady || cvLoading) return cvLoading;
   cvLoading = new Promise(res=>{
     const s = document.createElement('script');
     s.src = 'opencv.js'; s.async = true;
-    const done = ()=>{ cvReady = true; toast('High-accuracy stitching engine ready'); res(); };
+    const done = ()=>{ cvReady = true; cvSettled = true; toast('High-accuracy stitching engine ready'); res(); };
+    const fail = ()=>{ cvSettled = true; res(); };
     s.onload = ()=>{
       const c = window.cv;
-      if (!c) return res();
+      if (!c) return fail();
       if (typeof c.then === 'function') c.then(m=>{ window.cv = m; done(); });
       else if (c.Mat) done();
       else c.onRuntimeInitialized = done;
     };
-    s.onerror = ()=>res();
+    s.onerror = fail;
     document.head.appendChild(s);
   });
   return cvLoading;
@@ -614,7 +613,7 @@ function tryCV(q, gp, mask, gv){
     }
     if (A.length < 10) return null;               // little overlap — frontier shot, paint by gyro
     // RANSAC over 2-point rotation hypotheses
-    const cosThr = Math.cos(1.2*D2R), cosSep = Math.cos(3*D2R);
+    const cosThr = Math.cos(1.5*D2R), cosSep = Math.cos(3*D2R);
     let bi = null;
     for (let it=0; it<150; it++){
       const i = (Math.random()*A.length)|0, j = (Math.random()*A.length)|0;
@@ -628,7 +627,12 @@ function tryCV(q, gp, mask, gv){
       }
       if (!bi || cnt > bi.cnt) bi = {qh, cnt};
     }
-    if (!bi || bi.cnt < 8) return 'reject';       // overlap exists but won't reconcile (camera moved / blur)
+    // reject ONLY on strong evidence of mismatch: rich overlap that still
+    // won't reconcile. Sparse matches (blank walls) paint by gyro instead.
+    if (!bi || bi.cnt < 6){
+      return (A.length >= 16) ? 'reject' : null;
+    }
+    if (bi.cnt < 8) return null;
     // small-angle least-squares polish on the inliers
     let qc = bi.qh;
     for (let pass=0; pass<2; pass++){
@@ -695,7 +699,7 @@ function triadQuat(a1,a2,b1,b2){   // rotation R with R·a ≈ b, from two direc
     R[i*3+j]=B1[i]*A1[j]+B2[i]*A2[j]+B3[i]*A3[j];
   return matToQuat(R);
 }
-function refineShot(q){
+function refineShot(q, skipCV){
   const S = ALIGN, HALF = S/2, M = 20, SUB = 2;
   gl.bindFramebuffer(gl.FRAMEBUFFER, predFbo);
   gl.viewport(0,0,S,S);
@@ -725,7 +729,7 @@ function refineShot(q){
       gv[i] = 0.299*vv[iv]+0.587*vv[iv+1]+0.114*vv[iv+2];
     }
   }
-  if (cvReady && window.cv && cv.Mat){
+  if (!skipCV && cvReady && window.cv && cv.Mat){
     const r = tryCV(q, gp, mask, gv);
     if (r === 'reject') return 'reject';
     if (r) return r;                    // feature alignment succeeded
@@ -837,7 +841,8 @@ function channelGains(q){
     }
   }
   if (n < 1500 || tr < n || tg < n || tb < n) return [1,1,1];
-  const cl = v => Math.max(0.6, Math.min(1.6, v));
+  // damp toward 1 so per-shot corrections can't cascade into a tint drift
+  const cl = v => Math.max(0.7, Math.min(1.4, 1 + (v-1)*0.7));
   return [cl(sr/tr), cl(sg/tg), cl(sb/tb)];
 }
 
@@ -865,6 +870,13 @@ function captureShot(target){
   let q = deviceQuat.slice(), gains = [1,1,1], refined = null;
   videoToTexture();
   try{ refined = refineShot(q); }catch(e){}
+  if (refined === 'reject' && target){
+    target.rejects = (target.rejects || 0) + 1;
+    if (target.rejects >= 2){
+      // second attempt on the same dot: accept it rather than block progress
+      try{ refined = refineShot(q, true); }catch(e){ refined = null; }
+    }
+  }
   if (refined === 'reject'){
     // painting a shot the matcher can't reconcile smears the sphere — skip it
     lastShotAt = performance.now() - 250;
@@ -998,7 +1010,10 @@ function drawCaptureFrame(now){
       $('hint').textContent = nextAng < 6*D2R ? 'Hold steady…' : 'Point the circle at the amber dot';
     }
     // auto shutter: aligned + still, held ~420 ms (stillness = sharper frames)
-    const cool = now - lastShotAt > 600;
+    // camera opens instantly; only the auto-shutter briefly waits for the engine
+    const engineWait = !cvReady && !cvSettled && (now - captureStartedAt < 12000);
+    if (engineWait) $('hint').textContent = 'Preparing high-accuracy engine…';
+    const cool = now - lastShotAt > 600 && !engineWait;
     if (cool && nextAng < 5.5*D2R && angVel < 0.28){
       if (!alignSince){ alignSince = now; playTone(880, 0.04, 0, 0.07); }   // lock-on tick
       const prog = Math.min(1, (now-alignSince)/420);
@@ -1276,7 +1291,7 @@ $('gyroBtn2').addEventListener('click', toggleGyro);
 addEventListener('resize', ()=>{ sizeGL(); sizeOverlay(); });
 
 /* ---------------- PWA install + updates ---------------- */
-const APP_VERSION = '2.5';
+const APP_VERSION = '2.6';
 $('verLine').textContent = 'SphereCam v' + APP_VERSION + ' · ';
 let swReg = null, waitingSW = null;
 let hadController = ('serviceWorker' in navigator) && !!navigator.serviceWorker.controller;
