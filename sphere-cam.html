@@ -508,6 +508,10 @@ async function startCapture(){
       ? 'Camera access was denied. Allow it in Safari settings and retry.'
       : 'Camera error: ' + err.name); return;
   }
+  if (!cvReady){                      // shots aligned without the engine smear more — wait for it
+    toast('Loading high-accuracy engine…');
+    await Promise.race([loadOpenCV(), new Promise(r=>setTimeout(r, 20000))]);
+  }
   video.srcObject = stream;
   try{ await video.play(); }catch(e){}
   await new Promise(res=>{
@@ -519,6 +523,8 @@ async function startCapture(){
   keepAwake(true);
   setMode('capture');
   toast('Sphere ' + PW + '×' + PH + ' • camera ' + video.videoWidth + '×' + video.videoHeight);
+  setTimeout(()=>{ if (mode === 'capture')
+    toast('Tip: keep the phone in one spot — rotate your body, not your arm'); }, 2800);
   setTimeout(()=>{ if(!gotGyro && mode==='capture')
     toast('No motion data — capture needs a phone with a gyroscope (iPhone/Android).'); }, 2500);
 }
@@ -606,7 +612,7 @@ function tryCV(q, gp, mask, gv){
         PP.push(p1); PV.push(p2);
       }
     }
-    if (A.length < 10) return null;
+    if (A.length < 10) return null;               // little overlap — frontier shot, paint by gyro
     // RANSAC over 2-point rotation hypotheses
     const cosThr = Math.cos(1.2*D2R), cosSep = Math.cos(3*D2R);
     let bi = null;
@@ -622,7 +628,7 @@ function tryCV(q, gp, mask, gv){
       }
       if (!bi || cnt > bi.cnt) bi = {qh, cnt};
     }
-    if (!bi || bi.cnt < 8) return null;
+    if (!bi || bi.cnt < 8) return 'reject';       // overlap exists but won't reconcile (camera moved / blur)
     // small-angle least-squares polish on the inliers
     let qc = bi.qh;
     for (let pass=0; pass<2; pass++){
@@ -721,6 +727,7 @@ function refineShot(q){
   }
   if (cvReady && window.cv && cv.Mat){
     const r = tryCV(q, gp, mask, gv);
+    if (r === 'reject') return 'reject';
     if (r) return r;                    // feature alignment succeeded
   }
   const evalShift = (g, sx, sy) => {
@@ -855,9 +862,16 @@ function videoToTexture(){
 }
 function captureShot(target){
   if (!deviceQuat || !video.videoWidth || video.readyState < 2) return;
-  let q = deviceQuat.slice(), gains = [1,1,1];
+  let q = deviceQuat.slice(), gains = [1,1,1], refined = null;
   videoToTexture();
-  try{ const r = refineShot(q); q = r.q; }catch(e){}
+  try{ refined = refineShot(q); }catch(e){}
+  if (refined === 'reject'){
+    // painting a shot the matcher can't reconcile smears the sphere — skip it
+    lastShotAt = performance.now() - 250;
+    toast('Couldn’t match that shot — hold steady, pivot in place, aim again');
+    return;
+  }
+  if (refined && refined.q) q = refined.q;
   try{ gains = channelGains(q); }catch(e){}
 
   gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
@@ -985,7 +999,7 @@ function drawCaptureFrame(now){
     }
     // auto shutter: aligned + still, held ~420 ms (stillness = sharper frames)
     const cool = now - lastShotAt > 600;
-    if (cool && nextAng < 5.5*D2R && angVel < 0.35){
+    if (cool && nextAng < 5.5*D2R && angVel < 0.28){
       if (!alignSince){ alignSince = now; playTone(880, 0.04, 0, 0.07); }   // lock-on tick
       const prog = Math.min(1, (now-alignSince)/420);
       ctx.strokeStyle = '#FFB454'; ctx.lineWidth = 4*DPR;
@@ -1262,7 +1276,7 @@ $('gyroBtn2').addEventListener('click', toggleGyro);
 addEventListener('resize', ()=>{ sizeGL(); sizeOverlay(); });
 
 /* ---------------- PWA install + updates ---------------- */
-const APP_VERSION = '2.4';
+const APP_VERSION = '2.5';
 $('verLine').textContent = 'SphereCam v' + APP_VERSION + ' · ';
 let swReg = null, waitingSW = null;
 let hadController = ('serviceWorker' in navigator) && !!navigator.serviceWorker.controller;
@@ -1326,8 +1340,10 @@ $('installBtn').addEventListener('click', async ()=>{
 });
 
 function tick(now){
-  if (mode === 'capture') drawCaptureFrame(now);
-  else if ((mode === 'result' || mode === 'viewer') && gl) renderView();
+  try{
+    if (mode === 'capture') drawCaptureFrame(now);
+    else if ((mode === 'result' || mode === 'viewer') && gl) renderView();
+  }catch(e){}                          // one bad frame must never kill the loop
   requestAnimationFrame(tick);
 }
 requestAnimationFrame(tick);
