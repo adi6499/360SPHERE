@@ -5,7 +5,8 @@ A web version of Google Pixel's Photo Sphere camera, so **iPhone (and Android) u
 **Live app (after enabling GitHub Pages):** `https://adi6499.github.io/360SPHERE/`
 
 ## What it does
-1. **Guided capture** — opens the rear camera, reads the gyroscope, and shows ~30 glowing dots around you. Aim the circle at each dot, hold steady, and the shot snaps itself onto the sphere.
+0. **Three capture modes** — **Wide** (front view, 6 shots → normal photo), **Panorama** (one 360° ring → interactive strip), **Sphere** (full 360°, all around).
+1. **Guided capture** — opens the rear camera, reads the gyroscope, and shows glowing dots around you. Aim the circle at each dot, hold steady, and the shot snaps itself onto the sphere. Each shot is then pixel-aligned against the overlap and exposure-matched before painting.
 2. **Live stitching** — every frame is projected onto an equirectangular panorama on your phone's GPU (WebGL). A mini map shows the sphere filling in as you go. Nothing is uploaded anywhere.
 3. **Interactive viewer** — drag (or turn your phone, with Gyro on) to look around the result. Also opens any existing 2:1 equirectangular 360 photo.
 4. **Real 360° export** — saves a JPEG with Google GPano XMP metadata embedded, so Google Photos, Facebook and VR viewers recognize it as an interactive 360.

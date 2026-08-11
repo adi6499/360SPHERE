@@ -24,6 +24,13 @@
   .hero h1{font-size:clamp(30px,8vw,44px);line-height:1.12;margin:18px 0 10px;font-weight:700;letter-spacing:-.02em;text-wrap:balance;}
   .hero p{color:var(--mut);font-size:16px;line-height:1.5;max-width:34ch;margin:0;}
   #sphereArt{width:132px;height:132px;margin:26px 0 6px;}
+  .modes{display:flex;gap:8px;margin-bottom:12px;}
+  .mode{flex:1;display:flex;flex-direction:column;gap:3px;align-items:flex-start;text-align:left;
+    background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:11px 12px;}
+  .mode b{font-size:14px;font-weight:650;}
+  .mode span{color:var(--mut);font-size:11.5px;line-height:1.3;}
+  .mode.on{border-color:var(--amber);background:#1D1A12;}
+  .mode.on b{color:var(--amber);}
   .actions{display:flex;flex-direction:column;gap:12px;}
   .btn{display:flex;align-items:center;justify-content:center;gap:10px;border-radius:14px;
     padding:16px 20px;font-size:17px;font-weight:600;background:var(--panel);border:1px solid var(--line);}
@@ -105,6 +112,11 @@
     </div>
   </div>
   <div>
+    <div class="modes" id="modeRow">
+      <button class="mode" data-mode="wide"><b>Wide</b><span>Front view, 6&nbsp;shots</span></button>
+      <button class="mode" data-mode="pano"><b>Panorama</b><span>360° strip, one&nbsp;ring</span></button>
+      <button class="mode on" data-mode="sphere"><b>Sphere</b><span>Full 360°, all&nbsp;around</span></button>
+    </div>
     <div class="actions">
       <button class="btn primary" id="startBtn">Capture a sphere</button>
       <button class="btn" id="openViewerBtn">View a 360° photo</button>
@@ -139,7 +151,7 @@
       <button class="chip" id="gyroBtn1">Gyro: off</button>
     </div>
     <div class="pano-actions">
-      <div class="pano-note">Drag to look around. The saved photo opens as an interactive 360° in Google&nbsp;Photos, Facebook and VR viewers.</div>
+      <div class="pano-note" id="resultNote">Drag to look around. The saved photo opens as an interactive 360° in Google&nbsp;Photos, Facebook and VR viewers.</div>
       <div class="row">
         <button class="btn" id="retakeBtn">Retake</button>
         <button class="btn primary" id="saveBtn">Save 360° photo</button>
@@ -337,8 +349,18 @@ function clearPano(){
 
 /* ---------------- capture state ---------------- */
 let mode = 'home';
+let captureMode = 'sphere';            // 'wide' | 'pano' | 'sphere'
 let camTanH = 0.6, camTanV = 0.6;      // half-FOV tangents of the full video frame
 let targets = [], yawOffset = null, alignSince = 0, lastShotAt = 0, stream = null;
+
+const MODE_LABEL = { wide:'Capture a wide view', pano:'Capture a panorama', sphere:'Capture a sphere' };
+document.querySelectorAll('#modeRow .mode').forEach(btn=>{
+  btn.addEventListener('click', ()=>{
+    captureMode = btn.dataset.mode;
+    document.querySelectorAll('#modeRow .mode').forEach(b=>b.classList.toggle('on', b===btn));
+    $('startBtn').textContent = MODE_LABEL[captureMode];
+  });
+});
 
 function computeFov(){
   const vw = video.videoWidth, vh = video.videoHeight;
@@ -350,12 +372,20 @@ function makeTargets(){
   targets = [];
   const hFovDeg = 2*Math.atan(camTanH)/D2R;   // horizontal FOV (short side in portrait)
   const span = Math.max(18, hFovDeg - 14);    // 14° overlap gives the aligner evidence to work with
-  for (const pitch of [0, 45, -45]){
-    const n = Math.max(4, Math.ceil(360*Math.cos(pitch*D2R)/span));
-    for (let i=0;i<n;i++) targets.push({yaw:i*360/n, pitch, done:false});
+  if (captureMode === 'wide'){
+    for (const pitch of [22, -22])
+      for (const yaw of [-span, 0, span]) targets.push({yaw, pitch, done:false});
+  } else if (captureMode === 'pano'){
+    const n = Math.max(4, Math.ceil(360/span));
+    for (let i=0;i<n;i++) targets.push({yaw:i*360/n, pitch:0, done:false});
+  } else {
+    for (const pitch of [0, 45, -45]){
+      const n = Math.max(4, Math.ceil(360*Math.cos(pitch*D2R)/span));
+      for (let i=0;i<n;i++) targets.push({yaw:i*360/n, pitch, done:false});
+    }
+    targets.push({yaw:0, pitch:90, done:false});
+    targets.push({yaw:0, pitch:-90, done:false});
   }
-  targets.push({yaw:0, pitch:90, done:false});
-  targets.push({yaw:0, pitch:-90, done:false});
   yawOffset = null;
   updateCounter();
 }
@@ -705,18 +735,18 @@ $('fileInput').addEventListener('change', e=>{
 });
 
 /* ---------------- export: JPEG + GPano XMP ---------------- */
-function gpanoXmp(){
+function gpanoXmp(fw,fh,cw,ch,left,top){
   return '<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>' +
     '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">' +
     '<rdf:Description rdf:about="" xmlns:GPano="http://ns.google.com/photos/1.0/panorama/" ' +
     'GPano:ProjectionType="equirectangular" GPano:UsePanoramaViewer="True" ' +
-    `GPano:FullPanoWidthPixels="${PW}" GPano:FullPanoHeightPixels="${PH}" ` +
-    `GPano:CroppedAreaImageWidthPixels="${PW}" GPano:CroppedAreaImageHeightPixels="${PH}" ` +
-    'GPano:CroppedAreaLeftPixels="0" GPano:CroppedAreaTopPixels="0"/>' +
+    `GPano:FullPanoWidthPixels="${fw}" GPano:FullPanoHeightPixels="${fh}" ` +
+    `GPano:CroppedAreaImageWidthPixels="${cw}" GPano:CroppedAreaImageHeightPixels="${ch}" ` +
+    `GPano:CroppedAreaLeftPixels="${left}" GPano:CroppedAreaTopPixels="${top}"/>` +
     '</rdf:RDF></x:xmpmeta><?xpacket end="w"?>';
 }
-function addXmp(jpegBytes){
-  const payload = new TextEncoder().encode('http://ns.adobe.com/xap/1.0/\0' + gpanoXmp());
+function addXmp(jpegBytes, xml){
+  const payload = new TextEncoder().encode('http://ns.adobe.com/xap/1.0/\0' + xml);
   const seg = new Uint8Array(4 + payload.length);
   seg[0]=0xFF; seg[1]=0xE1;
   const len = payload.length + 2;
@@ -749,9 +779,37 @@ async function savePano(){
     }
   }
   ctx.putImageData(im,0,0);
-  const blob = await new Promise(r=>cv.toBlob(r,'image/jpeg',0.92));
-  const withMeta = addXmp(new Uint8Array(await blob.arrayBuffer()));
-  const file = new File([withMeta], 'sphere-' + Date.now() + '.jpg', {type:'image/jpeg'});
+
+  // per-mode output: sphere = full equirect; pano = horizontal strip (still a
+  // valid 360 via GPano crop fields); wide = plain photo of the front region
+  let out = cv, xml = gpanoXmp(PW,PH,PW,PH,0,0);
+  const vFovDeg = 2*Math.atan(camTanV)/D2R, hFovDeg = 2*Math.atan(camTanH)/D2R;
+  if (captureMode === 'pano'){
+    const halfDeg = Math.min(80, vFovDeg/2 + 6);
+    const top = Math.round((90-halfDeg)/180*PH);
+    const ch = Math.round(2*halfDeg/180*PH);
+    const o = document.createElement('canvas'); o.width = PW; o.height = ch;
+    o.getContext('2d').drawImage(cv, 0, top, PW, ch, 0, 0, PW, ch);
+    out = o; xml = gpanoXmp(PW,PH,PW,ch,0,top);
+  } else if (captureMode === 'wide'){
+    const span = Math.max(18, hFovDeg - 14);
+    const halfW = Math.min(85, span + hFovDeg/2 + 4);
+    const halfH = Math.min(80, 22 + vFovDeg/2 + 4);
+    const wpx = Math.round(2*halfW/360*PW), hpx = Math.round(2*halfH/180*PH);
+    const top = Math.round((90-halfH)/180*PH);
+    const cx = ((((yawOffset||0)+180)%360+360)%360)/360*PW;
+    const o = document.createElement('canvas'); o.width = wpx; o.height = hpx;
+    const c = o.getContext('2d');
+    let sx = Math.round(cx - wpx/2); sx = ((sx%PW)+PW)%PW;
+    const first = Math.min(wpx, PW - sx);
+    c.drawImage(cv, sx, top, first, hpx, 0, 0, first, hpx);
+    if (first < wpx) c.drawImage(cv, 0, top, wpx-first, hpx, first, 0, wpx-first, hpx);
+    out = o; xml = null;                          // a wide view is a normal photo
+  }
+  const blob = await new Promise(r=>out.toBlob(r,'image/jpeg',0.92));
+  let withMeta = new Uint8Array(await blob.arrayBuffer());
+  if (xml) withMeta = addXmp(withMeta, xml);
+  const file = new File([withMeta], captureMode + '-' + Date.now() + '.jpg', {type:'image/jpeg'});
   if (navigator.canShare && navigator.canShare({files:[file]})){
     try{ await navigator.share({files:[file]}); toast('Shared — pick “Save Image” to keep it.'); return; }
     catch(e){ if (e.name === 'AbortError') return; }
@@ -793,9 +851,15 @@ $('openViewerBtn').addEventListener('click', ()=>{ if(!gl){toast('WebGL unavaila
   curTex = imgTex; setMode('viewer'); $('fileInput').click(); });
 $('openFileBtn').addEventListener('click', ()=>$('fileInput').click());
 $('exitCaptureBtn').addEventListener('click', ()=>{ stopStream(); setMode('home'); });
+const RESULT_NOTES = {
+  sphere:'Drag to look around. The saved photo opens as an interactive 360° in Google Photos, Facebook and VR viewers.',
+  pano:'Drag to look around. Saves as a 360° panorama strip — still interactive in Google Photos and Facebook.',
+  wide:'Drag to look around. Saves as a regular wide photo.'
+};
 $('finishBtn').addEventListener('click', ()=>{
   stopStream(); curTex = panoTex;
-  viewYaw = 0; viewPitch = 0; viewVFov = 75;
+  viewYaw = yawOffset || 0; viewPitch = 0; viewVFov = 75;   // open facing the first shot
+  $('resultNote').textContent = RESULT_NOTES[captureMode];
   setMode('result');
 });
 $('retakeBtn').addEventListener('click', ()=>{ clearPano(); startCapture(); });
