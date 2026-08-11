@@ -134,6 +134,11 @@
       <button class="mode" data-mode="pano"><b>Panorama</b><span>360° strip, one&nbsp;ring</span></button>
       <button class="mode on" data-mode="sphere"><b>Sphere</b><span>Full 360°, all&nbsp;around</span></button>
     </div>
+    <div class="modes" id="resRow">
+      <button class="mode" data-res="2048"><b>2K</b><span>Fast &amp; light</span></button>
+      <button class="mode on" data-res="4096"><b>4K</b><span>Recommended</span></button>
+      <button class="mode" data-res="8192" id="res8k"><b>8K</b><span>Newest phones</span></button>
+    </div>
     <div class="actions">
       <button class="btn primary" id="startBtn">Capture a sphere</button>
       <button class="btn" id="openViewerBtn">View a 360° photo</button>
@@ -264,14 +269,17 @@ function onOrient(e){
 
 /* ---------------- WebGL setup ---------------- */
 const gl = glCanvas.getContext('webgl', {preserveDrawingBuffer:true});
-let PW = 4096, PH = 2048;                 // stitching canvas (equirect)
+let PW = 4096, PH = 2048;                 // stitching canvas (equirect) — set by allocPano()
 const IW = 4096, IH = 2048;               // imported-photo texture
+let maxTexSize = 0, canDo8K = false, allocPanoFn = null;
+let resWant = 4096;
+try{ resWant = parseInt(localStorage.getItem('sphereRes'),10) || 4096; }catch(e){}
 if (gl){
-  const maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+  maxTexSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
   const maxVp = gl.getParameter(gl.MAX_VIEWPORT_DIMS);
-  if (maxTex >= 8192 && maxVp && maxVp[0] >= 8192){ PW = 8192; PH = 4096; }  // 8K on capable GPUs
-  else if (maxTex < 4096){ PW = 2048; PH = 1024; }
+  canDo8K = maxTexSize >= 8192 && maxVp && maxVp[0] >= 8192;
 }
+if (!canDo8K && resWant > 4096) resWant = 4096;
 const VERT = `attribute vec2 aPos; varying vec2 vUV;
   void main(){ gl_Position = vec4(aPos,0.,1.); vUV = aPos*0.5+0.5; }`;
 const ROT = `vec3 qrot(vec4 q, vec3 v){ return v + 2.0*cross(q.xyz, cross(q.xyz,v) + q.w*v); }`;
@@ -341,9 +349,9 @@ if (gl){
   gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
 
-  // Allocate the panorama at the largest size the GPU actually accepts.
-  // 8K is 134 MB — some phones report support yet fail the allocation
-  // silently, which would leave capture painting into a dead buffer.
+  // Allocate the panorama at the size the user asked for, verified with a
+  // real render test — some phones claim support yet fail silently, which
+  // would leave capture painting into a dead buffer.
   fbo = gl.createFramebuffer();
   const tryAlloc = size => {
     gl.getError();                                   // clear stale errors
@@ -352,15 +360,33 @@ if (gl){
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
     let ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
-    if (ok){ gl.clearColor(0,0,0,0); gl.clear(gl.COLOR_BUFFER_BIT); ok = gl.getError() === gl.NO_ERROR; }
+    if (ok){                                         // prove a full-size draw + readback works
+      gl.viewport(0, 0, size, size/2);
+      gl.useProgram(progFlat);
+      gl.uniform1i(gl.getUniformLocation(progFlat,'uTex'), 0);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, imgTex);
+      drawQuad(progFlat);
+      const pt = new Uint8Array(4);
+      gl.readPixels(size-1, size/2-1, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pt);
+      ok = gl.getError() === gl.NO_ERROR && pt[3] === 255;
+      gl.clearColor(0,0,0,0); gl.clear(gl.COLOR_BUFFER_BIT);
+    }
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     if (!ok){ gl.deleteTexture(t); return null; }
     return t;
   };
-  for (const size of [PW, 4096, 2048]){
-    panoTex = tryAlloc(size);
-    if (panoTex){ PW = size; PH = size/2; break; }
-  }
+  allocPanoFn = want => {
+    if (panoTex){ try{ gl.deleteTexture(panoTex); }catch(e){} panoTex = null; }
+    const cands = [...new Set([want, 4096, 2048])].filter(s => s <= Math.max(2048, maxTexSize));
+    for (const size of cands){
+      const t = tryAlloc(size);
+      if (t){ panoTex = t; PW = size; PH = size/2; break; }
+    }
+    if (curTex !== imgTex) curTex = panoTex;
+    return PW;
+  };
+  allocPanoFn(resWant);
   predTex = makeTex(ALIGN, ALIGN);
   // 192 is non-power-of-two: REPEAT would make it unsampleable (we only readPixels, but keep it legal)
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -399,6 +425,21 @@ document.querySelectorAll('#modeRow .mode').forEach(btn=>{
     captureMode = btn.dataset.mode;
     document.querySelectorAll('#modeRow .mode').forEach(b=>b.classList.toggle('on', b===btn));
     $('startBtn').textContent = MODE_LABEL[captureMode];
+  });
+});
+/* resolution picker */
+if (!canDo8K) $('res8k').style.display = 'none';
+document.querySelectorAll('#resRow .mode').forEach(btn=>{
+  btn.classList.toggle('on', parseInt(btn.dataset.res,10) === resWant);
+  btn.addEventListener('click', ()=>{
+    resWant = parseInt(btn.dataset.res,10);
+    try{ localStorage.setItem('sphereRes', String(resWant)); }catch(e){}
+    document.querySelectorAll('#resRow .mode').forEach(b=>b.classList.toggle('on', b===btn));
+    if (allocPanoFn){
+      const got = allocPanoFn(resWant);
+      toast(got === resWant ? 'Output set to ' + got + '×' + (got/2)
+                            : 'This phone maxes out at ' + got + '×' + (got/2));
+    }
   });
 });
 
@@ -471,8 +512,9 @@ async function startCapture(){
     window.addEventListener('deviceorientation', onOrient);
   }catch(err){ toast('Could not access motion sensors: ' + err.message); return; }
   try{
+    const camW = PW >= 8192 ? 2560 : 1920, camH = PW >= 8192 ? 1920 : 1440;
     stream = await navigator.mediaDevices.getUserMedia({
-      video:{ facingMode:{ideal:'environment'}, width:{ideal:4032}, height:{ideal:3024} }, audio:false });
+      video:{ facingMode:{ideal:'environment'}, width:{ideal:camW}, height:{ideal:camH} }, audio:false });
   }catch(err){
     toast(err.name === 'NotAllowedError'
       ? 'Camera access was denied. Allow it in Safari settings and retry.'
@@ -485,8 +527,10 @@ async function startCapture(){
     video.onloadedmetadata = ()=>res();
   });
   computeFov(); makeTargets(); clearPano();
+  paintChecked = false;
   keepAwake(true);
   setMode('capture');
+  toast('Sphere ' + PW + '×' + PH + ' • camera ' + video.videoWidth + '×' + video.videoHeight);
   setTimeout(()=>{ if(!gotGyro && mode==='capture')
     toast('No motion data — capture needs a phone with a gyroscope (iPhone/Android).'); }, 2500);
 }
@@ -673,7 +717,7 @@ function refineShot(q){
   gl.readPixels(0,0,S,S,gl.RGBA,gl.UNSIGNED_BYTE,pp);
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
-  thumbCtx.drawImage(video, 0, 0, S, S);
+  thumbCtx.drawImage(capCanvas || video, 0, 0, S, S);
   const vv = thumbCtx.getImageData(0,0,S,S).data;
 
   const gp = new Float32Array(S*S), gv = new Float32Array(S*S), mask = new Uint8Array(S*S);
@@ -768,13 +812,30 @@ function refineShot(q){
   return {q: Q.mul(q, qc), gain};
 }
 
-function captureShot(target){
-  if (!deviceQuat || !video.videoWidth) return;
-  let q = deviceQuat.slice(), gain = 1;
-  try{ const r = refineShot(q); q = r.q; gain = r.gain; }catch(e){}
+/* Video frames are copied through a 2D canvas before the GPU upload —
+   uploading a <video> element directly gives silent black frames on some
+   iOS versions, which produced empty spheres. Canvas copies are reliable. */
+let capCanvas = null, capCtx = null;
+let paintChecked = false;
+function videoToTexture(){
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!capCanvas){
+    capCanvas = document.createElement('canvas');
+    capCtx = capCanvas.getContext('2d');
+  }
+  if (capCanvas.width !== vw || capCanvas.height !== vh){
+    capCanvas.width = vw; capCanvas.height = vh;
+  }
+  capCtx.drawImage(video, 0, 0, vw, vh);
   gl.bindTexture(gl.TEXTURE_2D, videoTex);
   gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, capCanvas);
+}
+function captureShot(target){
+  if (!deviceQuat || !video.videoWidth || video.readyState < 2) return;
+  let q = deviceQuat.slice(), gain = 1;
+  videoToTexture();
+  try{ const r = refineShot(q); q = r.q; gain = r.gain; }catch(e){}
 
   gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
   gl.viewport(0,0,PW,PH);
@@ -791,6 +852,20 @@ function captureShot(target){
   gl.disable(gl.BLEND);
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
+  // one-time self-check on the first shot of each capture: did it land?
+  if (!paintChecked){
+    paintChecked = true;
+    const d = Q.rot(q, [0,0,-1]);
+    const lam = Math.atan2(d[0], -d[2]), phi = Math.asin(Math.max(-1, Math.min(1, d[1])));
+    const x = ((Math.floor((lam/(2*Math.PI)+0.5)*PW))%PW+PW)%PW;
+    const y = Math.max(0, Math.min(PH-1, Math.floor((phi/Math.PI+0.5)*PH)));
+    const pt = new Uint8Array(4);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pt);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    if (pt[3] === 0) toast('⚠️ Shots are not reaching the sphere — please report this');
+    else if (pt[0]+pt[1]+pt[2] < 6) toast('⚠️ Camera frames look black — close and reopen the app');
+  }
   if (target) target.done = true;
   lastShotAt = performance.now();
   updateCounter();
@@ -1162,7 +1237,7 @@ $('gyroBtn2').addEventListener('click', toggleGyro);
 addEventListener('resize', ()=>{ sizeGL(); sizeOverlay(); });
 
 /* ---------------- PWA install + updates ---------------- */
-const APP_VERSION = '2.1';
+const APP_VERSION = '2.2';
 $('verLine').textContent = 'SphereCam v' + APP_VERSION + ' · ';
 let swReg = null, waitingSW = null;
 let hadController = ('serviceWorker' in navigator) && !!navigator.serviceWorker.controller;
