@@ -190,10 +190,10 @@ const Q = {
     a[3]*b[3]-a[0]*b[0]-a[1]*b[1]-a[2]*b[2]]; },
   conj(q){ return [-q[0],-q[1],-q[2],q[3]]; },
   axisAngle(ax,ang){ const s=Math.sin(ang/2); return [ax[0]*s,ax[1]*s,ax[2]*s,Math.cos(ang/2)]; },
-  fromEulerZXY(x,y,z){
+  fromEulerYXZ(x,y,z){   // device orientation is ZXY in device axes = YXZ in our Y-up world
     const c1=Math.cos(x/2),c2=Math.cos(y/2),c3=Math.cos(z/2);
     const s1=Math.sin(x/2),s2=Math.sin(y/2),s3=Math.sin(z/2);
-    return [s1*c2*c3-c1*s2*s3, c1*s2*c3+s1*c2*s3, c1*c2*s3+s1*s2*c3, c1*c2*c3-s1*s2*s3]; },
+    return [s1*c2*c3+c1*s2*s3, c1*s2*c3-s1*c2*s3, c1*c2*s3-s1*s2*c3, c1*c2*c3+s1*s2*s3]; },
   rot(q,v){
     const tx=2*(q[1]*v[2]-q[2]*v[1]), ty=2*(q[2]*v[0]-q[0]*v[2]), tz=2*(q[0]*v[1]-q[1]*v[0]);
     return [v[0]+q[3]*tx+(q[1]*tz-q[2]*ty), v[1]+q[3]*ty+(q[2]*tx-q[0]*tz), v[2]+q[3]*tz+(q[0]*ty-q[1]*tx)]; }
@@ -211,7 +211,7 @@ function onOrient(e){
   gotGyro = true;
   const orient = ((screen.orientation && typeof screen.orientation.angle === 'number')
     ? screen.orientation.angle : (window.orientation || 0)) * D2R;
-  let q = Q.fromEulerZXY(e.beta*D2R, e.alpha*D2R, -e.gamma*D2R);
+  let q = Q.fromEulerYXZ(e.beta*D2R, e.alpha*D2R, -e.gamma*D2R);
   q = Q.mul(q, [-Math.SQRT1_2, 0, 0, Math.SQRT1_2]);          // look out the back camera
   q = Q.mul(q, Q.axisAngle([0,0,1], -orient));                 // screen rotation
   const now = performance.now();
