@@ -90,6 +90,10 @@
   #dragHint{position:absolute;top:50%;left:0;right:0;text-align:center;color:#fff;opacity:.8;font-size:14px;
     text-shadow:0 1px 6px #000;pointer-events:none;transition:opacity .6s;}
 
+  #updateBanner{position:fixed;top:calc(env(safe-area-inset-top) + 10px);left:50%;transform:translateX(-50%);
+    z-index:60;display:none;background:var(--amber);color:#20160A;font-weight:650;border-radius:999px;
+    padding:12px 20px;font-size:14.5px;box-shadow:0 6px 20px rgba(0,0,0,.5);}
+  #updateBanner.on{display:block;}
   #toast{position:fixed;left:50%;bottom:calc(env(safe-area-inset-bottom) + 96px);transform:translateX(-50%);
     background:var(--panel);border:1px solid var(--line);color:var(--text);border-radius:12px;
     padding:12px 18px;font-size:14px;z-index:50;opacity:0;transition:opacity .3s;max-width:86vw;text-align:center;}
@@ -192,6 +196,7 @@
 
 <canvas id="gl"></canvas>
 <div id="flash"></div>
+<button id="updateBanner">⬆&nbsp; Update ready — tap to install</button>
 <div id="toast" role="status"></div>
 <input type="file" id="fileInput" accept="image/*">
 
@@ -328,7 +333,6 @@ if (gl){
     gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
     return t;
   };
-  panoTex = makeTex(PW,PH);
   imgTex  = makeTex(IW,IH);
   videoTex = gl.createTexture();
   gl.bindTexture(gl.TEXTURE_2D, videoTex);
@@ -337,9 +341,26 @@ if (gl){
   gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
 
+  // Allocate the panorama at the largest size the GPU actually accepts.
+  // 8K is 134 MB — some phones report support yet fail the allocation
+  // silently, which would leave capture painting into a dead buffer.
   fbo = gl.createFramebuffer();
-  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
-  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, panoTex, 0);
+  const tryAlloc = size => {
+    gl.getError();                                   // clear stale errors
+    const t = makeTex(size, size/2);
+    if (gl.getError() !== gl.NO_ERROR){ gl.deleteTexture(t); return null; }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+    let ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+    if (ok){ gl.clearColor(0,0,0,0); gl.clear(gl.COLOR_BUFFER_BIT); ok = gl.getError() === gl.NO_ERROR; }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    if (!ok){ gl.deleteTexture(t); return null; }
+    return t;
+  };
+  for (const size of [PW, 4096, 2048]){
+    panoTex = tryAlloc(size);
+    if (panoTex){ PW = size; PH = size/2; break; }
+  }
   predTex = makeTex(ALIGN, ALIGN);
   // 192 is non-power-of-two: REPEAT would make it unsampleable (we only readPixels, but keep it legal)
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -415,8 +436,32 @@ function updateCounter(){
   $('finishBtn').disabled = done === 0;
 }
 
+/* ---------------- sounds (generated, no assets) ---------------- */
+let audioCtx = null;
+function initAudio(){
+  try{
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.resume) audioCtx.resume();
+  }catch(e){}
+}
+function playTone(freq, dur, when, vol, type){
+  if (!audioCtx) return;
+  try{
+    const t0 = audioCtx.currentTime + (when||0);
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = type || 'sine'; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol||0.12, t0);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0+dur);
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(t0); o.stop(t0+dur+0.02);
+  }catch(e){}
+}
+const shutterSound = ()=>{ playTone(1250,0.06,0,0.12,'square'); playTone(620,0.05,0.05,0.10,'square'); };
+const doneSound    = ()=>{ playTone(660,0.12,0,0.12); playTone(880,0.18,0.12,0.12); };
+
 async function startCapture(){
   if (!gl){ toast('WebGL is not available in this browser.'); return; }
+  initAudio();                           // must start inside the tap gesture
   loadOpenCV();                          // warm up the feature engine in the background
   try{
     if (window.DeviceOrientationEvent && typeof DeviceOrientationEvent.requestPermission === 'function'){
@@ -749,6 +794,8 @@ function captureShot(target){
   if (target) target.done = true;
   lastShotAt = performance.now();
   updateCounter();
+  shutterSound();
+  if (!targets.some(t=>!t.done)) doneSound();
   const fl = $('flash'); fl.style.opacity = .7;
   requestAnimationFrame(()=>{ setTimeout(()=>fl.style.opacity = 0, 60); });
   renderFlatPreview();
@@ -1079,6 +1126,7 @@ function setMode(m){
   mode = m;
   for (const id of ['home','capture','result','viewer'])
     $(id).classList.toggle('on', id === m);
+  $('updateBanner').classList.toggle('on', !!waitingSW && m !== 'capture');
   sizeGL(); sizeOverlay();
   if (m === 'capture') renderFlatPreview();
   if (m === 'viewer') $('dragHint').style.opacity = .8;
@@ -1114,7 +1162,7 @@ $('gyroBtn2').addEventListener('click', toggleGyro);
 addEventListener('resize', ()=>{ sizeGL(); sizeOverlay(); });
 
 /* ---------------- PWA install + updates ---------------- */
-const APP_VERSION = '2.0';
+const APP_VERSION = '2.1';
 $('verLine').textContent = 'SphereCam v' + APP_VERSION + ' · ';
 let swReg = null, waitingSW = null;
 let hadController = ('serviceWorker' in navigator) && !!navigator.serviceWorker.controller;
@@ -1123,8 +1171,12 @@ function showUpdateReady(sw){
   const b = $('updateBtn');
   b.style.display = 'flex';
   b.textContent = 'Update ready — tap to restart';
+  if (mode !== 'capture') $('updateBanner').classList.add('on');
   toast('A new version of SphereCam is ready.');
 }
+$('updateBanner').addEventListener('click', ()=>{
+  if (waitingSW){ waitingSW.postMessage({type:'SKIP_WAITING'}); toast('Updating…'); }
+});
 if ('serviceWorker' in navigator){
   navigator.serviceWorker.register('sw.js').then(reg=>{   // absent on the artifact copy — fine
     swReg = reg;
@@ -1141,6 +1193,12 @@ if ('serviceWorker' in navigator){
     if (!hadController){ hadController = true; return; }   // first install: nothing to restart
     location.reload();                                     // update activated → relaunch fresh
   });
+  // long-lived home-screen apps don't reload on their own — re-check on
+  // every return to the app and every 30 minutes
+  document.addEventListener('visibilitychange', ()=>{
+    if (!document.hidden && swReg) swReg.update().catch(()=>{});
+  });
+  setInterval(()=>{ if (swReg) swReg.update().catch(()=>{}); }, 30*60*1000);
 }
 $('updateBtn').addEventListener('click', async ()=>{
   if (waitingSW){ waitingSW.postMessage({type:'SKIP_WAITING'}); toast('Updating…'); return; }
