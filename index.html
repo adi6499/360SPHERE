@@ -427,7 +427,7 @@ async function startCapture(){
   }catch(err){ toast('Could not access motion sensors: ' + err.message); return; }
   try{
     stream = await navigator.mediaDevices.getUserMedia({
-      video:{ facingMode:{ideal:'environment'}, width:{ideal:2560}, height:{ideal:1920} }, audio:false });
+      video:{ facingMode:{ideal:'environment'}, width:{ideal:4032}, height:{ideal:3024} }, audio:false });
   }catch(err){
     toast(err.name === 'NotAllowedError'
       ? 'Camera access was denied. Allow it in Safari settings and retry.'
