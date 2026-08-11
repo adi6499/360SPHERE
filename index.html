@@ -296,7 +296,8 @@ const FRAG_PAINT = `precision highp float; varying vec2 vUV;
     if (abs(t.x) > 1.0 || abs(t.y) > 1.0) discard;
     vec2 uv = vec2(t.x*0.5+0.5, 0.5 - t.y*0.5);
     float a = smoothstep(1.0,0.82,abs(t.x)) * smoothstep(1.0,0.82,abs(t.y));
-    gl_FragColor = vec4(min(texture2D(uTex, uv).rgb * uGain, 1.0), max(a, 0.05));
+    if (a < 0.02) discard;   // no low-alpha floor: it stamped faint tinted bands over neighbours
+    gl_FragColor = vec4(min(texture2D(uTex, uv).rgb * uGain, 1.0), a);
   }`;
 const FRAG_FLAT = `precision highp float; varying vec2 vUV; uniform sampler2D uTex;
   void main(){
@@ -1186,6 +1187,7 @@ async function savePano(){
   const band = document.createElement('canvas'); band.width = PW; band.height = BAND;
   const bctx = band.getContext('2d');
   const px = new Uint8Array(PW*BAND*4);
+  const rowCov = new Uint32Array(PH);              // per-row coverage, to trim black borders
   gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
   for (let y0=0; y0<PH; y0+=BAND){
     const bh = Math.min(BAND, PH-y0);
@@ -1197,6 +1199,7 @@ async function savePano(){
       const src=(bh-1-r)*PW*4, dst=r*PW*4;           // flip vertically within band
       for (let x=0; x<PW*4; x+=4){
         const a = px[src+x+3]/255;
+        if (a > 0.5) rowCov[y0+r]++;
         // stored colors are premultiplied by coverage — composite over the
         // background WITHOUT re-multiplying (re-multiplying darkened edges)
         d[dst+x]   = Math.min(255, px[src+x]   + 18*(1-a));
@@ -1213,12 +1216,20 @@ async function savePano(){
 
   // per-mode output: sphere = full equirect; pano = horizontal strip (still a
   // valid 360 via GPano crop fields); wide = plain photo of the front region
+  // rows that actually hold imagery (trims black borders off pano/wide crops)
+  const covThr = PW * 0.02;
+  let cTop = 0; while (cTop < PH-1 && rowCov[cTop] < covThr) cTop++;
+  let cBot = PH-1; while (cBot > cTop && rowCov[cBot] < covThr) cBot--;
+  const covTopE = Math.floor(cTop*scale), covBotE = Math.ceil((cBot+1)*scale);
+
   let out = cv, xml = gpanoXmp(EW,EH,EW,EH,0,0);
   const vFovDeg = 2*Math.atan(camTanV)/D2R, hFovDeg = 2*Math.atan(camTanH)/D2R;
   if (captureMode === 'pano'){
     const halfDeg = Math.min(80, vFovDeg/2 + 6);
-    const top = Math.round((90-halfDeg)/180*EH);
-    const ch = Math.round(2*halfDeg/180*EH);
+    let top = Math.round((90-halfDeg)/180*EH);
+    let bot = top + Math.round(2*halfDeg/180*EH);
+    if (covBotE - covTopE >= 64){ top = Math.max(top, covTopE); bot = Math.min(bot, covBotE); }
+    const ch = bot - top;
     const o = document.createElement('canvas'); o.width = EW; o.height = ch;
     o.getContext('2d').drawImage(cv, 0, top, EW, ch, 0, 0, EW, ch);
     out = o; xml = gpanoXmp(EW,EH,EW,ch,0,top);
@@ -1226,8 +1237,11 @@ async function savePano(){
     const span = Math.max(18, hFovDeg - 14);
     const halfW = Math.min(85, span + hFovDeg/2 + 4);
     const halfH = Math.min(80, 22 + vFovDeg/2 + 4);
-    const wpx = Math.round(2*halfW/360*EW), hpx = Math.round(2*halfH/180*EH);
-    const top = Math.round((90-halfH)/180*EH);
+    const wpx = Math.round(2*halfW/360*EW);
+    let top = Math.round((90-halfH)/180*EH);
+    let bot = top + Math.round(2*halfH/180*EH);
+    if (covBotE - covTopE >= 64){ top = Math.max(top, covTopE); bot = Math.min(bot, covBotE); }
+    const hpx = bot - top;
     const cx = ((((yawOffset||0)+180)%360+360)%360)/360*EW;
     const o = document.createElement('canvas'); o.width = wpx; o.height = hpx;
     const c = o.getContext('2d');
@@ -1304,7 +1318,7 @@ $('gyroBtn2').addEventListener('click', toggleGyro);
 addEventListener('resize', ()=>{ sizeGL(); sizeOverlay(); });
 
 /* ---------------- PWA install + updates ---------------- */
-const APP_VERSION = '2.6';
+const APP_VERSION = '2.7';
 $('verLine').textContent = 'SphereCam v' + APP_VERSION + ' · ';
 let swReg = null, waitingSW = null;
 let hadController = ('serviceWorker' in navigator) && !!navigator.serviceWorker.controller;
