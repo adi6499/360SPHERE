@@ -1,7 +1,7 @@
 /* SphereCam service worker — network-first with offline fallback.
    New versions install in the background and WAIT until the user taps
    "Update ready — tap to restart" (the page then posts SKIP_WAITING). */
-const CACHE = 'spherecam-v5';
+const CACHE = 'spherecam-v6';
 const CORE = ['.', 'index.html', 'manifest.webmanifest', 'opencv.js',
               'icon-192.png', 'icon-512.png', 'icon-180.png'];
 

@@ -272,7 +272,7 @@ const VERT = `attribute vec2 aPos; varying vec2 vUV;
   void main(){ gl_Position = vec4(aPos,0.,1.); vUV = aPos*0.5+0.5; }`;
 const ROT = `vec3 qrot(vec4 q, vec3 v){ return v + 2.0*cross(q.xyz, cross(q.xyz,v) + q.w*v); }`;
 const FRAG_PAINT = `precision highp float; varying vec2 vUV;
-  uniform vec4 uQInv; uniform vec2 uTan; uniform float uGain; uniform sampler2D uTex; ${ROT}
+  uniform vec4 uQInv; uniform vec2 uTan; uniform vec3 uGain; uniform sampler2D uTex; ${ROT}
   void main(){
     float lam = (vUV.x*2.0-1.0)*3.14159265;
     float phi = (vUV.y-0.5)*3.14159265;
@@ -288,7 +288,7 @@ const FRAG_PAINT = `precision highp float; varying vec2 vUV;
 const FRAG_FLAT = `precision highp float; varying vec2 vUV; uniform sampler2D uTex;
   void main(){
     vec4 c = texture2D(uTex, vUV);
-    gl_FragColor = vec4(mix(vec3(0.06,0.07,0.08), c.rgb, c.a), 1.0);
+    gl_FragColor = vec4(vec3(0.06,0.07,0.08)*(1.0-c.a) + c.rgb, 1.0);
   }`;
 const FRAG_VIEW = `precision highp float; varying vec2 vUV;
   uniform vec4 uQ; uniform vec2 uTan; uniform sampler2D uTex; ${ROT}
@@ -299,7 +299,7 @@ const FRAG_VIEW = `precision highp float; varying vec2 vUV;
     float lam = atan(d.x, -d.z);
     float phi = asin(clamp(d.y,-1.0,1.0));
     vec4 c = texture2D(uTex, vec2(lam/6.2831853+0.5, phi/3.14159265+0.5));
-    gl_FragColor = vec4(mix(vec3(0.06,0.07,0.08), c.rgb, c.a), 1.0);
+    gl_FragColor = vec4(vec3(0.06,0.07,0.08)*(1.0-c.a) + c.rgb, 1.0);
   }`;
 
 function makeProg(fragSrc){
@@ -314,7 +314,7 @@ const ALIGN = 256;                 // alignment thumbnail size
 if (gl){
   progPaint = makeProg(FRAG_PAINT); progFlat = makeProg(FRAG_FLAT); progView = makeProg(FRAG_VIEW);
   // predict variant: same render but exposes pano coverage in the alpha channel
-  progPredict = makeProg(FRAG_VIEW.replace('c.a), 1.0);', 'c.a), c.a);'));
+  progPredict = makeProg(FRAG_VIEW.replace('c.rgb, 1.0);', 'c.rgb, c.a);'));
   quadBuf = gl.createBuffer();
   gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
   gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
@@ -485,8 +485,8 @@ function playTone(freq, dur, when, vol, type){
     o.start(t0); o.stop(t0+dur+0.02);
   }catch(e){}
 }
-const shutterSound = ()=>{ playTone(1250,0.06,0,0.12,'square'); playTone(620,0.05,0.05,0.10,'square'); };
-const doneSound    = ()=>{ playTone(660,0.12,0,0.12); playTone(880,0.18,0.12,0.12); };
+const shutterSound = ()=>{ playTone(1250,0.06,0,0.22,'square'); playTone(620,0.05,0.05,0.18,'square'); };
+const doneSound    = ()=>{ playTone(660,0.12,0,0.2); playTone(880,0.18,0.12,0.2); };
 
 async function startCapture(){
   if (!gl){ toast('WebGL is not available in this browser.'); return; }
@@ -800,6 +800,40 @@ function refineShot(q){
   return {q: Q.mul(q, qc), gain};
 }
 
+/* Per-channel color matching: the iPhone re-decides white balance between
+   shots (bluish toward windows, warm indoors). Compare the pano's existing
+   colors with this frame in the overlap and correct R/G/B independently. */
+function channelGains(q){
+  const S = ALIGN;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, predFbo);
+  gl.viewport(0,0,S,S);
+  gl.disable(gl.BLEND);
+  gl.useProgram(progPredict);
+  gl.uniform4fv(gl.getUniformLocation(progPredict,'uQ'), q);
+  gl.uniform2f(gl.getUniformLocation(progPredict,'uTan'), camTanH, camTanV);
+  gl.uniform1i(gl.getUniformLocation(progPredict,'uTex'), 0);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, panoTex);
+  drawQuad(progPredict);
+  const pp = new Uint8Array(S*S*4);
+  gl.readPixels(0,0,S,S,gl.RGBA,gl.UNSIGNED_BYTE,pp);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  thumbCtx.drawImage(capCanvas || video, 0, 0, S, S);
+  const vv = thumbCtx.getImageData(0,0,S,S).data;
+  let sr=0,sg=0,sb=0, tr=0,tg=0,tb=0, n=0;
+  for (let y=0; y<S; y++){
+    for (let x=0; x<S; x++){
+      const ip = ((S-1-y)*S+x)*4, iv = (y*S+x)*4;   // readPixels rows are bottom-up
+      if (pp[ip+3] < 250) continue;
+      sr+=pp[ip]; sg+=pp[ip+1]; sb+=pp[ip+2];
+      tr+=vv[iv]; tg+=vv[iv+1]; tb+=vv[iv+2]; n++;
+    }
+  }
+  if (n < 1500 || tr < n || tg < n || tb < n) return [1,1,1];
+  const cl = v => Math.max(0.6, Math.min(1.6, v));
+  return [cl(sr/tr), cl(sg/tg), cl(sb/tb)];
+}
+
 /* Video frames are copied through a 2D canvas before the GPU upload —
    uploading a <video> element directly gives silent black frames on some
    iOS versions, which produced empty spheres. Canvas copies are reliable. */
@@ -821,16 +855,17 @@ function videoToTexture(){
 }
 function captureShot(target){
   if (!deviceQuat || !video.videoWidth || video.readyState < 2) return;
-  let q = deviceQuat.slice(), gain = 1;
+  let q = deviceQuat.slice(), gains = [1,1,1];
   videoToTexture();
-  try{ const r = refineShot(q); q = r.q; gain = r.gain; }catch(e){}
+  try{ const r = refineShot(q); q = r.q; }catch(e){}
+  try{ gains = channelGains(q); }catch(e){}
 
   gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
   gl.viewport(0,0,PW,PH);
   gl.useProgram(progPaint);
   gl.uniform4fv(gl.getUniformLocation(progPaint,'uQInv'), Q.conj(q));
   gl.uniform2f(gl.getUniformLocation(progPaint,'uTan'), camTanH, camTanV);
-  gl.uniform1f(gl.getUniformLocation(progPaint,'uGain'), gain);
+  gl.uniform3f(gl.getUniformLocation(progPaint,'uGain'), gains[0], gains[1], gains[2]);
   gl.uniform1i(gl.getUniformLocation(progPaint,'uTex'), 0);
   gl.activeTexture(gl.TEXTURE0);
   gl.bindTexture(gl.TEXTURE_2D, videoTex);
@@ -951,7 +986,7 @@ function drawCaptureFrame(now){
     // auto shutter: aligned + still, held ~420 ms (stillness = sharper frames)
     const cool = now - lastShotAt > 600;
     if (cool && nextAng < 5.5*D2R && angVel < 0.35){
-      if (!alignSince) alignSince = now;
+      if (!alignSince){ alignSince = now; playTone(880, 0.04, 0, 0.07); }   // lock-on tick
       const prog = Math.min(1, (now-alignSince)/420);
       ctx.strokeStyle = '#FFB454'; ctx.lineWidth = 4*DPR;
       ctx.beginPath(); ctx.arc(cx,cy,R,-Math.PI/2,-Math.PI/2+prog*2*Math.PI); ctx.stroke();
@@ -1120,9 +1155,11 @@ async function savePano(){
       const src=(bh-1-r)*PW*4, dst=r*PW*4;           // flip vertically within band
       for (let x=0; x<PW*4; x+=4){
         const a = px[src+x+3]/255;
-        d[dst+x]   = px[src+x]*a   + 18*(1-a);
-        d[dst+x+1] = px[src+x+1]*a + 20*(1-a);
-        d[dst+x+2] = px[src+x+2]*a + 22*(1-a);
+        // stored colors are premultiplied by coverage — composite over the
+        // background WITHOUT re-multiplying (re-multiplying darkened edges)
+        d[dst+x]   = Math.min(255, px[src+x]   + 18*(1-a));
+        d[dst+x+1] = Math.min(255, px[src+x+1] + 20*(1-a));
+        d[dst+x+2] = Math.min(255, px[src+x+2] + 22*(1-a));
         d[dst+x+3] = 255;
       }
     }
@@ -1212,7 +1249,7 @@ const RESULT_NOTES = {
 $('finishBtn').addEventListener('click', ()=>{
   stopStream(); curTex = panoTex;
   viewYaw = yawOffset || 0; viewPitch = 0; viewVFov = 75;   // open facing the first shot
-  $('resultNote').textContent = RESULT_NOTES[captureMode];
+  $('resultNote').textContent = RESULT_NOTES[captureMode] + ' Master ' + PW + '×' + PH + '.';
   setMode('result');
 });
 $('retakeBtn').addEventListener('click', ()=>{ clearPano(); startCapture(); });
@@ -1225,7 +1262,7 @@ $('gyroBtn2').addEventListener('click', toggleGyro);
 addEventListener('resize', ()=>{ sizeGL(); sizeOverlay(); });
 
 /* ---------------- PWA install + updates ---------------- */
-const APP_VERSION = '2.3';
+const APP_VERSION = '2.4';
 $('verLine').textContent = 'SphereCam v' + APP_VERSION + ' · ';
 let swReg = null, waitingSW = null;
 let hadController = ('serviceWorker' in navigator) && !!navigator.serviceWorker.controller;
